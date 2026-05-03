@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.1
+
+Re-publish of 2.1.0. The 2.1.0 release ran CI without `@types/node` and the
+publish workflow failed at `tsc --noEmit` (`Cannot find module 'node:async_hooks'`).
+2.1.1 ships the same code plus the missing devDep so CI green-lights publish.
+
 ## 2.1.0
 
 ### Added
