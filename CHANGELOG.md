@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.1.9
+
+`getBootstrapHtml()` is now self-contained — consumers just inline its
+output and get a fully-wired client.
+
+### Fixed
+
+- **i18n profile pass-through.** `shipeasy({ i18nDefaultProfile })` was
+  honored for the SSR string fetch but the loader `<script>` injected by
+  `getBootstrapHtml()` always used the hardcoded `"en:prod"` default, so
+  client-side runtime translation lookups missed every key whenever the
+  caller used a non-default profile. The closure now forwards
+  `i18nProfile` so the loader and the SSR fetch agree.
+
+### Added
+
+- **Edit-labels shim baked into bootstrap.** When `?se_edit_labels=1` is
+  in the URL, `getBootstrapHtml()` now emits a `window.i18n` setter
+  interceptor as the first statement of its script. Both the inline SSR
+  shim and the later CDN loader assignment get wrapped, so every
+  translated string is rendered as `￹key￺value￻` for the devtools overlay
+  to scan. Previously consumers had to add this shim manually in
+  `<head>` before the bootstrap script — easy to forget and silently
+  broke in-place editing in production.
+
 ## 2.1.8
 
 Drop unused `zod` peer dependency (the SDK source has no `zod` imports — the
