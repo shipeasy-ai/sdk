@@ -60,10 +60,10 @@
   },
   "devDependencies": {
     "@types/murmurhash-js": "^1.0.6",
-    "@types/node": "^20.0.0",
+    "@types/node": "^25.6.0",
     "tsup": "^8.3.0",
-    "typescript": "^5.7.4",
-    "vitest": "^2.1.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5",
     "wrangler": "^4.83.0"
   },
   "publishConfig": {
