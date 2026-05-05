@@ -1078,7 +1078,7 @@ function getSSRI18nStore(): { strings: Record<string, string>; locale: string } 
 function isEditLabelsMode(): boolean {
   if (typeof window !== "undefined") {
     // Client: check bootstrap payload (set by server) or live URL param.
-     
+
     return (
       !!(window as any).__SE_BOOTSTRAP?.editLabels ||
       new URLSearchParams(location.search).has("se_edit_labels")
@@ -1163,8 +1163,7 @@ function _makeBuiltinTags(): I18nRichComponents {
           if (tag !== "br" && tag !== "hr") el.textContent = text;
           return el;
         }
-      : (text: string) =>
-          tag === "br" || tag === "hr" ? `<${tag}>` : `<${tag}>${text}</${tag}>`;
+      : (text: string) => (tag === "br" || tag === "hr" ? `<${tag}>` : `<${tag}>${text}</${tag}>`);
   }
   return tags;
 }

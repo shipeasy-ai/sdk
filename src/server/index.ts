@@ -774,7 +774,11 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     configs: bootstrap.configs,
     experiments: bootstrap.experiments,
     getBootstrapHtml() {
-      return getBootstrapHtml(bootstrap, i18nData, { apiKey: clientKey, editLabels });
+      return getBootstrapHtml(bootstrap, i18nData, {
+        apiKey: clientKey,
+        editLabels,
+        i18nProfile: profile,
+      });
     },
   };
 }
@@ -819,6 +823,33 @@ export function getBootstrapHtml(
   };
   if (i18nData) payload.i18n = i18nData;
   if (opts.editLabels) payload.editLabels = true;
+
+  // Edit-labels shim. With ?se_edit_labels=1 the devtools overlay needs every
+  // translated string to render as `￹key￺value￻` so it can scan
+  // the DOM and enable in-place editing. We define a setter on window.i18n
+  // that intercepts the inline shim's assignment (a few lines below) AND any
+  // later assignment from the CDN loader, wrapping .t() in both cases. Must
+  // be the first statement so neither assignment slips past unwrapped.
+  parts.push(
+    `(function(){` +
+      `if(!new URLSearchParams(location.search).has('se_edit_labels'))return;` +
+      `var R;` +
+      `function P(v){` +
+      `if(!v||typeof v.t!=='function'||v.__sePatched)return;` +
+      `var O=v.t.bind(v);` +
+      `v.__sePatched=true;` +
+      `window._sei18n_t=O;` +
+      `v.t=function(k,vars){` +
+      `var r=O(k,vars);` +
+      `return r===k?k:'\\uFFF9'+k+'\\uFFFA'+r+'\\uFFFB';` +
+      `};` +
+      `}` +
+      `Object.defineProperty(window,'i18n',{configurable:true,` +
+      `get:function(){return R;},` +
+      `set:function(v){P(v);R=v;}});` +
+      `})();`,
+  );
+
   parts.push(`window.__SE_BOOTSTRAP=${JSON.stringify(payload)};`);
 
   if (i18nData?.strings && Object.keys(i18nData.strings).length > 0) {
