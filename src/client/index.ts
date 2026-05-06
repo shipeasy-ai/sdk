@@ -1083,6 +1083,14 @@ function getSSRI18nStore(): { strings: Record<string, string>; locale: string } 
   return (globalThis as any)[_I18N_SSR_SYM]?.() ?? null;
 }
 
+// Server-side fallback symbol kept in lockstep with server/index.ts so the
+// client module can read edit-mode without depending on server/index.ts having
+// installed its property getter on globalThis. Next.js bundles RSC, SSR and
+// Edge layers separately — the layer that runs t() may not be the one that
+// imported `@shipeasy/sdk/server`, so the getter side-effect can't be relied
+// on. Reading the fallback symbol directly works regardless of import order.
+const _EDIT_MODE_FALLBACK_SYM = Symbol.for("@shipeasy/sdk:ssr-edit-mode-fallback");
+
 function isEditLabelsMode(): boolean {
   if (typeof window !== "undefined") {
     // Client: check bootstrap payload (set by server) or live URL param.
@@ -1093,9 +1101,16 @@ function isEditLabelsMode(): boolean {
     );
   }
   // SSR: read directly from globalThis where the server SDK writes it.
+  // Try the property getter first (more accurate via ALS), then fall back to
+  // the plain global so we still get the right answer when only one of the
+  // two SDK module instances was loaded in this RSC/SSR layer.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const val = (globalThis as any)[_EDIT_MODE_SSR_SYM];
-  return typeof val === "boolean" ? val : typeof val === "function" ? val() : false;
+  if (typeof val === "boolean") return val;
+  if (typeof val === "function") return (val as () => boolean)();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const fb = (globalThis as any)[_EDIT_MODE_FALLBACK_SYM];
+  return typeof fb === "boolean" ? fb : false;
 }
 
 export type I18nVariables = Record<string, string | number | null | undefined>;

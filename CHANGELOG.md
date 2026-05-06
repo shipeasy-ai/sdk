@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.1.12
+
+### Fixed
+
+- **SSR `t()` wasn't wrapping with markers** because edit-labels mode is
+  detected via URL param, but apps running on opennext-cloudflare don't
+  have a Node-runtime middleware to forward the URL into RSCs. The inline
+  patcher now sets a `se_edit_labels=1` cookie when it sees the URL param
+  on the client; `shipeasy()` reads that cookie via `next/headers().cookies()`
+  on subsequent requests so SSR knows. After enabling edit mode, **refresh
+  once** for SSR-rendered text to start arriving with markers.
+- `client/index.ts` `isEditLabelsMode()` falls back to reading the global
+  fallback symbol directly when the property getter installed by
+  `server/index.ts` isn't visible (Next.js bundles RSC, SSR and Edge
+  layers separately and the getter side-effect doesn't always make it
+  into the layer that runs `t()`).
+
 ## 2.1.11
 
 ### Changed

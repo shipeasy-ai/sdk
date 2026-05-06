@@ -749,10 +749,12 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
   if (opts.clientKey && !_rememberedClientKey) _rememberedClientKey = opts.clientKey;
   const profile = opts.i18nDefaultProfile ?? "en:prod";
   flags.configure({ apiKey });
-  // Resolve URL overrides: explicit opts.urlOverrides wins; otherwise try to
-  // read the x-se-search header injected by Next.js middleware so that
-  // ?se_edit_labels (and other devtools params) are detected without the
-  // caller having to forward searchParams manually.
+  // Resolve URL overrides: explicit opts.urlOverrides wins; otherwise try
+  // (a) the x-se-search header (injected by middleware when one is wired up)
+  // and (b) the `se_edit_labels` cookie that the inline patcher sets on the
+  // browser the first time it sees `?se_edit_labels=1`. The cookie is what
+  // makes SSR aware of edit-mode in deployments without middleware (apps
+  // running on opennext-cloudflare don't yet have a Node-runtime proxy).
   let resolvedUrlOverrides = opts.urlOverrides;
   if (!resolvedUrlOverrides) {
     try {
@@ -760,12 +762,22 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
       // Falls back silently in non-Next.js runtimes (Cloudflare Workers, etc.).
       // eslint-disable-next-line @typescript-eslint/ban-ts-comment
       // @ts-ignore — next/headers is an optional peer; absent in non-Next.js runtimes
-      const { headers } = (await import("next/headers")) as {
+      const { headers, cookies } = (await import("next/headers")) as {
         headers: () => Promise<Headers> | Headers;
+        cookies: () => Promise<{ get: (n: string) => { value: string } | undefined }> | {
+          get: (n: string) => { value: string } | undefined;
+        };
       };
       const h = await Promise.resolve(headers());
       const search = h.get("x-se-search") ?? "";
-      if (search) resolvedUrlOverrides = search;
+      if (search) {
+        resolvedUrlOverrides = search;
+      } else {
+        const c = await Promise.resolve(cookies());
+        if (c.get?.("se_edit_labels")?.value === "1") {
+          resolvedUrlOverrides = "se_edit_labels=1";
+        }
+      }
     } catch {}
   }
   // Set edit mode before i18n.init() idempotency check so the page's
@@ -843,6 +855,9 @@ export function getBootstrapHtml(
   parts.push(
     `(function(){` +
       `if(!new URLSearchParams(location.search).has('se_edit_labels'))return;` +
+      // Set a cookie so subsequent SSR renders detect edit mode without
+      // middleware (the URL param doesn't reach RSC by default).
+      `try{document.cookie='se_edit_labels=1;path=/;max-age=86400;samesite=lax';}catch(_){}` +
       `var R;` +
       `function P(v){` +
       `if(!v||typeof v.t!=='function'||v.__sePatched)return;` +
