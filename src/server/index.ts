@@ -852,12 +852,22 @@ export function getBootstrapHtml(
   // that intercepts the inline shim's assignment (a few lines below) AND any
   // later assignment from the CDN loader, wrapping .t() in both cases. Must
   // be the first statement so neither assignment slips past unwrapped.
+  //
+  // Detection mirrors the server: URL param OR persisted cookie. The cookie is
+  // what allows SSR to keep rendering markers across navigations after the
+  // first ?se_edit_labels=1 visit. If the client only checked the URL, the
+  // server would emit marker-wrapped text (cookie still set) while the client
+  // rendered plain text — a hydration mismatch on every navigation in the 24h
+  // cookie window.
   parts.push(
     `(function(){` +
-      `if(!new URLSearchParams(location.search).has('se_edit_labels'))return;` +
-      // Set a cookie so subsequent SSR renders detect edit mode without
-      // middleware (the URL param doesn't reach RSC by default).
-      `try{document.cookie='se_edit_labels=1;path=/;max-age=86400;samesite=lax';}catch(_){}` +
+      `var Q=new URLSearchParams(location.search).has('se_edit_labels');` +
+      `var C=/(?:^|;\\s*)se_edit_labels=1(?:;|$)/.test(document.cookie);` +
+      `if(!Q&&!C)return;` +
+      // Refresh the cookie on every URL-param visit so testers stay in edit
+      // mode for the next 24h without re-typing the param. Cookie-only visits
+      // skip the write — already set, no need to re-stamp.
+      `if(Q){try{document.cookie='se_edit_labels=1;path=/;max-age=86400;samesite=lax';}catch(_){}}` +
       `var R;` +
       `function P(v){` +
       `if(!v||typeof v.t!=='function'||v.__sePatched)return;` +
