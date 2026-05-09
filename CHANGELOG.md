@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.1.15
+
+### Fixed
+
+- **Edit-labels cookie no longer breaks hydration on later visits.** The
+  inline marker-patcher in the bootstrap script only activated when the
+  URL contained `?se_edit_labels=1`, but the server-side `i18n.t()` reads
+  the persisted `se_edit_labels=1` cookie (set automatically by the same
+  bootstrap on the first URL-param visit, max-age 24h). After the URL
+  param was stripped (a normal navigation), the server kept wrapping
+  strings with `￹key￺…￻` markers via the cookie, while
+  the client rendered plain strings — producing a React hydration
+  mismatch (error #418) on every page in the 24h cookie window. The
+  inline patcher now detects edit mode from the cookie too, matching
+  the server's detection, so SSR and hydration agree.
+
 ## 2.1.14
 
 ### Fixed
