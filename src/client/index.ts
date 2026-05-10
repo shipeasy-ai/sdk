@@ -479,7 +479,10 @@ export class FlagsClientBrowser {
     this.sdkKey = opts.sdkKey;
     this.baseUrl = (opts.baseUrl ?? "https://edge.shipeasy.dev").replace(/\/$/, "");
     this.env = opts.env ?? "prod";
-    this.autoGuardrails = opts.autoGuardrails !== false;
+    // Opt-in. Auto web vitals + JS error capture only when explicitly enabled,
+    // because the resulting __auto_* metric names must be approved in the project
+    // event catalog before /collect accepts them.
+    this.autoGuardrails = opts.autoGuardrails === true;
     this.anonId = getOrCreateAnonId();
     this.buffer = new EventBuffer(`${this.baseUrl}/collect`, this.sdkKey);
     void this.buffer.flushPendingAlias();
@@ -862,6 +865,12 @@ export interface ShipeasyClientConfig {
    * avoid the initial anon /sdk/evaluate round-trip.
    */
   autoIdentify?: boolean;
+  /**
+   * Capture web vitals (LCP, CLS, INP, TTFB, FCP) and JS/network errors as
+   * `__auto_*` metric events. Defaults to false (opt-in) — enabling requires the
+   * `__auto_*` event names to be approved in the project event catalog.
+   */
+  autoCollect?: boolean;
 }
 
 /**
@@ -878,6 +887,7 @@ export function shipeasy(opts: ShipeasyClientConfig): () => void {
   const client = configureShipeasy({
     sdkKey: opts.apiKey,
     baseUrl: opts.baseUrl ?? "https://cdn.shipeasy.ai",
+    autoGuardrails: opts.autoCollect === true,
   });
   flags.notifyMounted();
   if (opts.autoIdentify !== false) {
