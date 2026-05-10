@@ -1,5 +1,28 @@
 # Changelog
 
+## 2.2.0
+
+### Changed (breaking default)
+
+- **Auto-collected web vitals + JS error metrics are now opt-in.** The
+  browser SDK previously installed PerformanceObservers + global error
+  hooks on every `shipeasy()` boot and emitted `__auto_page_load`,
+  `__auto_lcp`, `__auto_cls`, `__auto_ttfb`, `__auto_fcp`, `__auto_fp`,
+  `__auto_dom_ready`, `__auto_js_error`, and `__auto_network_error`
+  events through `/collect`. Because `/collect` validates metric names
+  against the project's event catalog, this caused 422 errors and pending
+  catalog rows for every project that hadn't approved those names.
+  Auto-collection now requires `autoCollect: true` in `shipeasy(...)`:
+
+  ```ts
+  import { shipeasy } from "@shipeasy/sdk/client";
+  shipeasy({ apiKey: "...", autoCollect: true });
+  ```
+
+  Existing callers who relied on the prior behavior must add the flag.
+  The low-level `FlagsClientBrowser` accepts `autoGuardrails: true` for
+  the same effect (also flipped from previous default).
+
 ## 2.1.15
 
 ### Fixed
