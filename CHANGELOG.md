@@ -1,5 +1,35 @@
 # Changelog
 
+## 2.3.0
+
+### Changed (breaking default)
+
+- **`autoCollect` defaults back to ON.** 2.2.0 made auto-collection opt-in because
+  the worker's `/collect` endpoint rejected `__auto_*` events not present in the
+  project's event catalog. That validation now bypasses `__auto_*` names server-side
+  (the worker treats them as built-in system events), so the SDK ships with vitals,
+  errors, and engagement signals flowing on first install. This pairs with the new
+  metric-presets gallery in the admin UI — customers see real LCP/INP/error data
+  without per-event registration.
+
+- **Per-group opt-out.** `autoCollect` accepts either a boolean or an object
+  selecting individual groups:
+
+  ```ts
+  import { shipeasy } from "@shipeasy/sdk/client";
+
+  shipeasy({ apiKey });                                      // all groups on (new default)
+  shipeasy({ apiKey, autoCollect: false });                  // all off
+  shipeasy({ apiKey, autoCollect: { errors: false } });      // vitals + engagement only
+  ```
+
+  Groups: `vitals` (LCP, INP, CLS, TTFB, FCP, page_load, dom_ready, fp),
+  `errors` (`__auto_js_error`, `__auto_network_error`), `engagement`
+  (`__auto_abandoned`).
+
+- `FlagsClientBrowserOptions` gains an `autoGuardrailGroups?:
+  Partial<AutoCollectGroups>` field for low-level callers that bypass `shipeasy()`.
+
 ## 2.2.0
 
 ### Changed (breaking default)

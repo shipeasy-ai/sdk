@@ -192,7 +192,18 @@ class EventBuffer {
 // /collect with thousands of events while still letting us see >1 distinct error.
 const MAX_ERRORS_PER_SESSION = 5;
 
-function installAutoGuardrails(buffer: EventBuffer, userId: string, anonId: string): void {
+export interface AutoCollectGroups {
+  vitals: boolean;
+  errors: boolean;
+  engagement: boolean;
+}
+
+function installAutoGuardrails(
+  buffer: EventBuffer,
+  userId: string,
+  anonId: string,
+  groups: AutoCollectGroups,
+): void {
   if (typeof window === "undefined" || typeof PerformanceObserver === "undefined") return;
 
   let lcp: number | null = null;
@@ -202,113 +213,119 @@ function installAutoGuardrails(buffer: EventBuffer, userId: string, anonId: stri
   let netErrorCount = 0;
   let navTimingFlushed = false;
 
-  try {
-    const lcpObs = new PerformanceObserver((list) => {
-      const entries = list.getEntries();
-      if (entries.length)
-        lcp = (entries[entries.length - 1] as PerformanceEntry & { startTime: number }).startTime;
-    });
-    lcpObs.observe({ type: "largest-contentful-paint", buffered: true });
-  } catch {}
+  if (groups.vitals) {
+    try {
+      const lcpObs = new PerformanceObserver((list) => {
+        const entries = list.getEntries();
+        if (entries.length)
+          lcp = (entries[entries.length - 1] as PerformanceEntry & { startTime: number }).startTime;
+      });
+      lcpObs.observe({ type: "largest-contentful-paint", buffered: true });
+    } catch {}
 
-  try {
-    const inpObs = new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) {
-        const dur = (e as PerformanceEntry & { duration: number }).duration ?? 0;
-        if (inp === null || dur > inp) inp = dur;
-      }
-    });
-    inpObs.observe({
-      type: "event",
-      buffered: true,
-      durationThreshold: 16,
-    } as PerformanceObserverInit);
-  } catch {}
+    try {
+      const inpObs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          const dur = (e as PerformanceEntry & { duration: number }).duration ?? 0;
+          if (inp === null || dur > inp) inp = dur;
+        }
+      });
+      inpObs.observe({
+        type: "event",
+        buffered: true,
+        durationThreshold: 16,
+      } as PerformanceObserverInit);
+    } catch {}
 
-  try {
-    const clsObs = new PerformanceObserver((list) => {
-      for (const e of list.getEntries()) {
-        if ((e as PerformanceEntry & { value: number }).value > 0.1) clsBad = true;
-      }
-    });
-    clsObs.observe({ type: "layout-shift", buffered: true });
-  } catch {}
+    try {
+      const clsObs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          if ((e as PerformanceEntry & { value: number }).value > 0.1) clsBad = true;
+        }
+      });
+      clsObs.observe({ type: "layout-shift", buffered: true });
+    } catch {}
+  }
 
   // ---- Errors: split client (JS exception) vs request (HTTP failure). ----
-  const origOnError = window.onerror;
-  window.onerror = (msg, source, lineno, _colno, err) => {
-    if (jsErrorCount < MAX_ERRORS_PER_SESSION) {
-      jsErrorCount += 1;
-      buffer.pushMetric("__auto_js_error", userId, anonId, {
-        value: 1,
-        kind: "exception",
-        message: typeof msg === "string" ? msg.slice(0, 200) : String(err ?? "").slice(0, 200),
-        source: typeof source === "string" ? source.slice(0, 200) : "",
-        line: lineno ?? 0,
-      });
-    }
-    if (typeof origOnError === "function") return origOnError(msg, source, lineno, _colno, err);
-    return false;
-  };
-
-  window.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
-    if (jsErrorCount < MAX_ERRORS_PER_SESSION) {
-      jsErrorCount += 1;
-      const reason = (e as PromiseRejectionEvent).reason;
-      const message =
-        reason instanceof Error
-          ? reason.message
-          : typeof reason === "string"
-            ? reason
-            : String(reason);
-      buffer.pushMetric("__auto_js_error", userId, anonId, {
-        value: 1,
-        kind: "unhandled_rejection",
-        message: message.slice(0, 200),
-      });
-    }
-  });
-
-  const origFetch = window.fetch;
-  window.fetch = async function (...args) {
-    const startedAt = typeof performance !== "undefined" ? performance.now() : 0;
-    const url = typeof args[0] === "string" ? args[0] : (args[0] as Request | URL).toString();
-    let res: Response;
-    try {
-      res = await origFetch.apply(this, args);
-    } catch (err) {
-      // Network-level failure (DNS, offline, CORS, abort) — never reaches a status.
-      if (netErrorCount < MAX_ERRORS_PER_SESSION) {
-        netErrorCount += 1;
-        buffer.pushMetric("__auto_network_error", userId, anonId, {
+  if (groups.errors) {
+    const origOnError = window.onerror;
+    window.onerror = (msg, source, lineno, _colno, err) => {
+      if (jsErrorCount < MAX_ERRORS_PER_SESSION) {
+        jsErrorCount += 1;
+        buffer.pushMetric("__auto_js_error", userId, anonId, {
           value: 1,
-          kind: "network",
-          status: 0,
-          url: url.slice(0, 200),
+          kind: "exception",
+          message: typeof msg === "string" ? msg.slice(0, 200) : String(err ?? "").slice(0, 200),
+          source: typeof source === "string" ? source.slice(0, 200) : "",
+          line: lineno ?? 0,
         });
       }
-      throw err;
-    }
-    if (res.status >= 500 && netErrorCount < MAX_ERRORS_PER_SESSION) {
-      netErrorCount += 1;
-      const elapsed = typeof performance !== "undefined" ? performance.now() - startedAt : 0;
-      buffer.pushMetric("__auto_network_error", userId, anonId, {
-        value: 1,
-        kind: "5xx",
-        status: res.status,
-        url: url.slice(0, 200),
-        duration_ms: Math.round(elapsed),
-      });
-    }
-    return res;
-  };
+      if (typeof origOnError === "function") return origOnError(msg, source, lineno, _colno, err);
+      return false;
+    };
+
+    window.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
+      if (jsErrorCount < MAX_ERRORS_PER_SESSION) {
+        jsErrorCount += 1;
+        const reason = (e as PromiseRejectionEvent).reason;
+        const message =
+          reason instanceof Error
+            ? reason.message
+            : typeof reason === "string"
+              ? reason
+              : String(reason);
+        buffer.pushMetric("__auto_js_error", userId, anonId, {
+          value: 1,
+          kind: "unhandled_rejection",
+          message: message.slice(0, 200),
+        });
+      }
+    });
+
+    const origFetch = window.fetch;
+    window.fetch = async function (...args) {
+      const startedAt = typeof performance !== "undefined" ? performance.now() : 0;
+      const url = typeof args[0] === "string" ? args[0] : (args[0] as Request | URL).toString();
+      let res: Response;
+      try {
+        res = await origFetch.apply(this, args);
+      } catch (err) {
+        // Network-level failure (DNS, offline, CORS, abort) — never reaches a status.
+        if (netErrorCount < MAX_ERRORS_PER_SESSION) {
+          netErrorCount += 1;
+          buffer.pushMetric("__auto_network_error", userId, anonId, {
+            value: 1,
+            kind: "network",
+            status: 0,
+            url: url.slice(0, 200),
+          });
+        }
+        throw err;
+      }
+      if (res.status >= 500 && netErrorCount < MAX_ERRORS_PER_SESSION) {
+        netErrorCount += 1;
+        const elapsed = typeof performance !== "undefined" ? performance.now() - startedAt : 0;
+        buffer.pushMetric("__auto_network_error", userId, anonId, {
+          value: 1,
+          kind: "5xx",
+          status: res.status,
+          url: url.slice(0, 200),
+          duration_ms: Math.round(elapsed),
+        });
+      }
+      return res;
+    };
+  }
 
   // ---- Navigation timing & paint (page_load, ttfb, fp, fcp, dom_ready). ----
-  // These are available at the `load` event; we delay one tick so
-  // `loadEventEnd` is populated. Safe to call multiple times — guarded.
+  // These are part of the vitals group. Available at the `load` event; we
+  // delay one tick so `loadEventEnd` is populated. Safe to call multiple
+  // times — guarded.
   const flushNavTiming = () => {
     if (navTimingFlushed) return;
     navTimingFlushed = true;
+    if (!groups.vitals) return;
     try {
       const navList = performance.getEntriesByType("navigation") as PerformanceNavigationTiming[];
       const nav = navList[0];
@@ -341,34 +358,40 @@ function installAutoGuardrails(buffer: EventBuffer, userId: string, anonId: stri
     } catch {}
   };
 
-  if (document.readyState === "complete") {
-    // Page already finished loading — capture on next tick so loadEventEnd is set.
-    setTimeout(flushNavTiming, 0);
-  } else {
-    window.addEventListener(
-      "load",
-      () => {
-        // Defer one tick: the load event handler runs *before* loadEventEnd
-        // is finalised on the navigation entry.
-        setTimeout(flushNavTiming, 0);
-      },
-      { once: true },
-    );
+  // Need a hide handler if any group emits something on hide. Vitals emit
+  // LCP/INP/CLS/nav-timing; engagement emits the abandonment binary.
+  const needHide = groups.vitals || groups.engagement;
+  if (needHide) {
+    if (document.readyState === "complete") {
+      setTimeout(flushNavTiming, 0);
+    } else {
+      window.addEventListener(
+        "load",
+        () => {
+          setTimeout(flushNavTiming, 0);
+        },
+        { once: true },
+      );
+    }
+
+    const flushOnHide = () => {
+      flushNavTiming();
+      if (groups.vitals) {
+        if (lcp !== null) buffer.pushMetric("__auto_lcp", userId, anonId, { value: lcp });
+        if (inp !== null) buffer.pushMetric("__auto_inp", userId, anonId, { value: inp });
+        if (clsBad) buffer.pushMetric("__auto_cls_binary", userId, anonId, { value: 1 });
+      }
+      if (groups.engagement) {
+        const abandoned = lcp === null ? 1 : 0;
+        buffer.pushMetric("__auto_abandoned", userId, anonId, { value: abandoned });
+      }
+      buffer.flush(true);
+    };
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") flushOnHide();
+    });
   }
-
-  const flushOnHide = () => {
-    flushNavTiming();
-    if (lcp !== null) buffer.pushMetric("__auto_lcp", userId, anonId, { value: lcp });
-    if (inp !== null) buffer.pushMetric("__auto_inp", userId, anonId, { value: inp });
-    if (clsBad) buffer.pushMetric("__auto_cls_binary", userId, anonId, { value: 1 });
-    const abandoned = lcp === null ? 1 : 0;
-    buffer.pushMetric("__auto_abandoned", userId, anonId, { value: abandoned });
-    buffer.flush(true);
-  };
-
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") flushOnHide();
-  });
 }
 
 // ---- Anonymous ID ----
@@ -396,6 +419,13 @@ export interface FlagsClientBrowserOptions {
   sdkKey: string;
   baseUrl?: string;
   autoGuardrails?: boolean;
+  /**
+   * Per-group enablement for auto-collected metrics. When set, overrides the
+   * blanket `autoGuardrails` flag for the specific groups listed. Any group
+   * not present in the object falls back to `autoGuardrails` (defaulting to
+   * true when `autoGuardrails` is true).
+   */
+  autoGuardrailGroups?: Partial<AutoCollectGroups>;
   /** Which published env to read values from. Defaults to "prod". */
   env?: FlagsClientBrowserEnv;
 }
@@ -459,6 +489,7 @@ export class FlagsClientBrowser {
   private readonly sdkKey: string;
   private readonly baseUrl: string;
   private readonly autoGuardrails: boolean;
+  private readonly autoGuardrailGroups: AutoCollectGroups;
   private readonly env: FlagsClientBrowserEnv;
   private evalResult: EvalResponse | null = null;
   private anonId: string;
@@ -479,10 +510,17 @@ export class FlagsClientBrowser {
     this.sdkKey = opts.sdkKey;
     this.baseUrl = (opts.baseUrl ?? "https://edge.shipeasy.dev").replace(/\/$/, "");
     this.env = opts.env ?? "prod";
-    // Opt-in. Auto web vitals + JS error capture only when explicitly enabled,
-    // because the resulting __auto_* metric names must be approved in the project
-    // event catalog before /collect accepts them.
-    this.autoGuardrails = opts.autoGuardrails === true;
+    // Auto web vitals + JS error capture defaults ON. The worker bypasses
+    // event-catalog validation for `__auto_*` names so this is safe out of
+    // the box. Callers opt out by passing `autoGuardrails: false` or by
+    // narrowing per-group via `autoGuardrailGroups`.
+    this.autoGuardrails = opts.autoGuardrails !== false;
+    const g = opts.autoGuardrailGroups ?? {};
+    this.autoGuardrailGroups = {
+      vitals: g.vitals ?? this.autoGuardrails,
+      errors: g.errors ?? this.autoGuardrails,
+      engagement: g.engagement ?? this.autoGuardrails,
+    };
     this.anonId = getOrCreateAnonId();
     this.buffer = new EventBuffer(`${this.baseUrl}/collect`, this.sdkKey);
     void this.buffer.flushPendingAlias();
@@ -526,9 +564,13 @@ export class FlagsClientBrowser {
     if (seq !== this.identifySeq) return;
     this.evalResult = data;
 
-    if (this.autoGuardrails && !this.guardrailsInstalled) {
+    const anyGroupOn =
+      this.autoGuardrailGroups.vitals ||
+      this.autoGuardrailGroups.errors ||
+      this.autoGuardrailGroups.engagement;
+    if (anyGroupOn && !this.guardrailsInstalled) {
       this.guardrailsInstalled = true;
-      installAutoGuardrails(this.buffer, this.userId, this.anonId);
+      installAutoGuardrails(this.buffer, this.userId, this.anonId, this.autoGuardrailGroups);
     }
     this.notify();
   }
@@ -866,11 +908,20 @@ export interface ShipeasyClientConfig {
    */
   autoIdentify?: boolean;
   /**
-   * Capture web vitals (LCP, CLS, INP, TTFB, FCP) and JS/network errors as
-   * `__auto_*` metric events. Defaults to false (opt-in) — enabling requires the
-   * `__auto_*` event names to be approved in the project event catalog.
+   * Capture web vitals (LCP, CLS, INP, TTFB, FCP, navigation timing), JS /
+   * network errors, and engagement signals (abandonment) as `__auto_*`
+   * metric events. Defaults to `true` — the worker bypasses event-catalog
+   * validation for `__auto_*` names so this is safe out of the box.
+   *
+   * Pass `false` to disable everything, or a per-group object to narrow:
+   *
+   * ```ts
+   * shipeasy({ apiKey, autoCollect: false });                  // off
+   * shipeasy({ apiKey, autoCollect: { errors: false } });      // vitals + engagement only
+   * shipeasy({ apiKey });                                      // all groups on
+   * ```
    */
-  autoCollect?: boolean;
+  autoCollect?: boolean | Partial<AutoCollectGroups>;
 }
 
 /**
@@ -884,10 +935,15 @@ export interface ShipeasyClientConfig {
  * A later flags.identify({ user_id }) overrides this in place; anonId stays stable.
  */
 export function shipeasy(opts: ShipeasyClientConfig): () => void {
+  const ac = opts.autoCollect;
+  const blanket = ac === false ? false : true;
+  const groups: Partial<AutoCollectGroups> | undefined =
+    ac && typeof ac === "object" ? ac : undefined;
   const client = configureShipeasy({
     sdkKey: opts.apiKey,
     baseUrl: opts.baseUrl ?? "https://cdn.shipeasy.ai",
-    autoGuardrails: opts.autoCollect === true,
+    autoGuardrails: blanket,
+    autoGuardrailGroups: groups,
   });
   flags.notifyMounted();
   if (opts.autoIdentify !== false) {
