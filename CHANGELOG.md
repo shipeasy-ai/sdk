@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.4.0
+
+### Added
+
+- **`__auto_session_active` heartbeat.** Client emits a session-activity ping
+  in the `engagement` group on every page load, and again whenever the tab
+  returns to the foreground after being hidden for more than 30 minutes
+  (heuristic for a fresh session). Drives the new D1/D7/D30 retention
+  presets in the admin UI's metric template gallery — `count_users` of
+  `__auto_session_active` per day is the underlying signal.
+
+  No app changes required if `autoCollect.engagement` is on (the default).
+  Opt out the same way as the other engagement signals:
+
+  ```ts
+  shipeasy({ apiKey, autoCollect: { engagement: false } });
+  ```
+
 ## 2.3.0
 
 ### Changed (breaking default)

@@ -358,6 +358,27 @@ function installAutoGuardrails(
     } catch {}
   };
 
+  // Session activity heartbeat — emits once per page load and again every
+  // time the tab returns to the foreground after being hidden long enough
+  // to look like a separate session. Drives D1/D7/D30 retention metrics.
+  // Per-event, not per-tab: the dashboard counts unique users per day,
+  // so even one emit per session is enough to mark the user active.
+  if (groups.engagement) {
+    try {
+      buffer.pushMetric("__auto_session_active", userId, anonId, { value: 1 });
+    } catch {}
+    let lastEmit = Date.now();
+    const SESSION_GAP_MS = 30 * 60 * 1000; // 30m of hidden → new session
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - lastEmit < SESSION_GAP_MS) return;
+      try {
+        buffer.pushMetric("__auto_session_active", userId, anonId, { value: 1 });
+        lastEmit = Date.now();
+      } catch {}
+    });
+  }
+
   // Need a hide handler if any group emits something on hide. Vitals emit
   // LCP/INP/CLS/nav-timing; engagement emits the abandonment binary.
   const needHide = groups.vitals || groups.engagement;
