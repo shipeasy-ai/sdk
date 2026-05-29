@@ -737,14 +737,18 @@ export function _resetShipeasyServerForTests(): void {
 
 export interface ShipeasyServerConfig {
   /**
-   * Server-side API key — authenticates flag/experiment fetches from the edge.
-   * Never embedded in browser output. A warning is logged if omitted.
+   * Server-side API key — authenticates flag/experiment fetches from the edge
+   * (requireKey("server")). Never embedded in browser output. If omitted, flag
+   * and experiment evaluation is skipped and an error is logged — it is NOT
+   * substituted with clientKey (a client key 401s against /sdk/flags).
    */
   apiKey?: string;
   /**
    * Public client key — embedded in window.__SE_BOOTSTRAP and used by the
-   * browser SDK. Safe to expose (e.g. NEXT_PUBLIC_ env vars).
-   * Defaults to apiKey for single-key setups.
+   * browser SDK, and authenticates i18n string fetches (requireKey("client")).
+   * Safe to expose (e.g. NEXT_PUBLIC_ env vars). If omitted, i18n loading is
+   * skipped and an error is logged — it is NOT substituted with apiKey (a
+   * server key 401s against /sdk/i18n/strings).
    */
   clientKey?: string;
   /** Raw URL or query string for applying ?se_ks_* / ?se_cf_* / ?se_exp_* overrides. */
@@ -770,17 +774,34 @@ export interface ShipeasyServerHandle {
  * payloads and i18n falls back to hardcoded strings.
  */
 export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServerHandle> {
-  if (!opts.apiKey && !opts.clientKey) {
-    console.warn("[shipeasy] apiKey is required — flag evaluation and i18n will not load.");
-  } else if (!opts.apiKey) {
-    console.warn("[shipeasy] apiKey not set — falling back to clientKey for server requests.");
-  }
-  const apiKey = opts.apiKey ?? opts.clientKey ?? "";
-  // Resolution order: explicit opts.clientKey → remembered from first call →
-  // apiKey (last-resort, will 401 against /sdk/i18n/strings but matches old
-  // behaviour for non-i18n setups).
-  const clientKey = opts.clientKey ?? _rememberedClientKey ?? opts.apiKey ?? "";
+  // Server and client keys are NOT interchangeable. /sdk/flags and
+  // /sdk/experiments enforce requireKey("server"); /sdk/i18n/strings enforces
+  // requireKey("client"). Substituting one type for the other is never a
+  // graceful fallback — it's a request that cannot succeed (guaranteed 401) and
+  // it masks the real misconfig (a missing key silently becomes a phantom 401).
+  // So: no cross-type fallback. If the key an operation needs is absent, skip
+  // that operation and log a loud, actionable error instead of firing a doomed
+  // request.
+  const apiKey = opts.apiKey ?? "";
+  const clientKey = opts.clientKey ?? _rememberedClientKey ?? "";
   if (opts.clientKey && !_rememberedClientKey) _rememberedClientKey = opts.clientKey;
+  if (!apiKey) {
+    console.error(
+      "[shipeasy] No server key — flags & experiments skipped. Pass `apiKey` to " +
+        "shipeasy() with your server key (SHIPEASY_SERVER_KEY). Set it as a Worker " +
+        "secret with `wrangler secret put SHIPEASY_SERVER_KEY` (or add it to .env for " +
+        "local dev). Do not pass a client key here — /sdk/flags requires a server key " +
+        "and will 401.",
+    );
+  }
+  if (!clientKey) {
+    console.error(
+      "[shipeasy] No client key — i18n strings skipped, falling back to hardcoded text. " +
+        "Pass `clientKey` to shipeasy() with your public client key " +
+        "(NEXT_PUBLIC_SHIPEASY_CLIENT_KEY). Do not pass a server key here — " +
+        "/sdk/i18n/strings requires a client key and will 401.",
+    );
+  }
   const profile = opts.i18nDefaultProfile ?? "en:prod";
   flags.configure({ apiKey });
   // Resolve URL overrides: explicit opts.urlOverrides wins; otherwise try
@@ -820,7 +841,10 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     ? new URLSearchParams(resolvedUrlOverrides).has("se_edit_labels")
     : false;
   (globalThis as Record<symbol, unknown>)[_EDIT_MODE_SSR_SYM] = editLabels;
-  await Promise.allSettled([flags.initOnce(), i18n.init(clientKey, profile)]);
+  await Promise.allSettled([
+    apiKey ? flags.initOnce() : Promise.resolve(),
+    clientKey ? i18n.init(clientKey, profile) : Promise.resolve(),
+  ]);
 
   const bootstrap = flags.evaluate(opts.user ?? {}, resolvedUrlOverrides);
   const i18nData = i18n.getForRequest();

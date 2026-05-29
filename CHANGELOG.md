@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.5.2
+
+### Fixed
+
+- **Server SDK no longer falls back between server and client keys.** `shipeasy()`
+  from `@shipeasy/sdk/server` previously substituted the client key for a missing
+  `apiKey` (and the server key for a missing `clientKey`). Because `/sdk/flags` and
+  `/sdk/experiments` enforce a server key and `/sdk/i18n/strings` enforces a client
+  key, that fallback always produced guaranteed-401 requests and masked the real
+  misconfig. Now each key type is used only for its own endpoints: if the required
+  key is missing, that operation is skipped and a loud, actionable error is logged
+  (`No server key` / `No client key`) instead of firing a doomed request. Missing
+  `apiKey` → flags/experiments skipped; missing `clientKey` → i18n skipped, copy
+  falls back to hardcoded text. No more phantom 401s from minority render contexts
+  where the env binding reads empty.
+
 ## 2.5.1
 
 ### Fixed
