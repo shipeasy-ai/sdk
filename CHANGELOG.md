@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.5.0
+
+### Added
+
+- **`flags.ks(name, switch?)` killswitch reader.** Both `@shipeasy/sdk/server`
+  and `@shipeasy/sdk/client` expose a new `flags.ks(name, switchKey?)` that
+  returns the killswitch state for a given name. With no `switchKey`, returns
+  the top-level killed state. With a `switchKey`, returns the per-switch
+  override boolean. Backed by a new `killswitches` field on the bootstrap
+  blob; older blobs without the field cause `ks()` to return `false`.
+
 ## 2.4.0
 
 ### Added
