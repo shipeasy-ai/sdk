@@ -520,7 +520,7 @@ describe("FlagsClientBrowser", () => {
     vi.stubGlobal("fetch", mockFetch);
     vi.stubGlobal("setInterval", () => 1);
     sdk._resetShipeasyForTests();
-    sdk.shipeasy({ apiKey: "k", baseUrl: "http://x" });
+    sdk.shipeasy({ clientKey: "k", baseUrl: "http://x" });
     await sdk.flags.identify({ user_id: "u1" });
     expect(calls.length).toBe(2);
     expect(calls[0].user_id).toBeUndefined();
@@ -536,7 +536,7 @@ describe("FlagsClientBrowser", () => {
     vi.stubGlobal("fetch", mockFetch);
     vi.stubGlobal("setInterval", () => 1);
     sdk._resetShipeasyForTests();
-    sdk.shipeasy({ apiKey: "k", baseUrl: "http://x", autoIdentify: false });
+    sdk.shipeasy({ clientKey: "k", baseUrl: "http://x", autoIdentify: false });
     // Give microtasks a chance to run.
     await Promise.resolve();
     expect(mockFetch).not.toHaveBeenCalled();
@@ -658,16 +658,17 @@ describe("client flags.ks", () => {
   });
 });
 
-describe("server shipeasy() — no cross-type key fallback", () => {
+describe("server shipeasy() — single server key, no client key", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
-  function stubFetchOk(): string[] {
-    const calls: string[] = [];
-    const fetchMock = vi.fn(async (url: string) => {
-      calls.push(String(url));
+  function stubFetchOk(): { url: string; key: string | null }[] {
+    const calls: { url: string; key: string | null }[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ url: String(url), key: headers["X-SDK-Key"] ?? null });
       return {
         ok: true,
         status: 200,
@@ -687,46 +688,39 @@ describe("server shipeasy() — no cross-type key fallback", () => {
     return calls;
   }
 
-  it("missing server key → skips /sdk/flags + /sdk/experiments, logs error, no client-key fallback", async () => {
-    vi.resetModules();
-    const calls = stubFetchOk();
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const { shipeasy } = await import("../server");
-    await shipeasy({ clientKey: "client-only" });
-    expect(calls.some((u) => u.includes("/sdk/flags"))).toBe(false);
-    expect(calls.some((u) => u.includes("/sdk/experiments"))).toBe(false);
-    expect(errSpy.mock.calls.flat().join(" ")).toContain("No server key");
-  });
-
-  it("missing client key → skips /sdk/i18n/strings, logs error, no server-key fallback", async () => {
-    vi.resetModules();
-    const calls = stubFetchOk();
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const { shipeasy } = await import("../server");
-    await shipeasy({ apiKey: "server-only" });
-    expect(calls.some((u) => u.includes("/sdk/i18n"))).toBe(false);
-    expect(errSpy.mock.calls.flat().join(" ")).toContain("No client key");
-  });
-
-  it("neither key → both operations skipped, two errors logged", async () => {
+  it("missing server key → skips flags, experiments AND i18n, logs one error", async () => {
     vi.resetModules();
     const calls = stubFetchOk();
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const { shipeasy } = await import("../server");
     await shipeasy({});
     expect(calls.length).toBe(0);
-    const logged = errSpy.mock.calls.flat().join(" ");
-    expect(logged).toContain("No server key");
-    expect(logged).toContain("No client key");
+    expect(errSpy.mock.calls.flat().join(" ")).toContain("No server key");
   });
 
-  it("both keys present → fetches flags/experiments with server key and i18n with client key", async () => {
+  it("server key present → fetches flags/experiments AND i18n, all with the server key", async () => {
     vi.resetModules();
     const calls = stubFetchOk();
     vi.spyOn(console, "error").mockImplementation(() => {});
     const { shipeasy } = await import("../server");
-    await shipeasy({ apiKey: "server", clientKey: "client" });
-    expect(calls.some((u) => u.includes("/sdk/flags"))).toBe(true);
-    expect(calls.some((u) => u.includes("/sdk/i18n"))).toBe(true);
+    await shipeasy({ serverKey: "srv_key_123" });
+    const flagsCall = calls.find((c) => c.url.includes("/sdk/flags"));
+    const i18nCall = calls.find((c) => c.url.includes("/sdk/i18n"));
+    expect(flagsCall).toBeTruthy();
+    expect(i18nCall).toBeTruthy();
+    // The same server key authenticates every server-side fetch — never a client key.
+    expect(flagsCall?.key).toBe("srv_key_123");
+    expect(i18nCall?.key).toBe("srv_key_123");
+  });
+
+  it("getBootstrapHtml embeds no SDK key (server key must never reach the browser)", async () => {
+    vi.resetModules();
+    stubFetchOk();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { shipeasy } = await import("../server");
+    const handle = await shipeasy({ serverKey: "srv_key_secret" });
+    const html = handle.getBootstrapHtml();
+    expect(html).not.toContain("srv_key_secret");
+    expect(html).not.toContain("apiKey");
   });
 });

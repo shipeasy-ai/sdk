@@ -711,12 +711,6 @@ export async function fetchLabelsForSSR(opts: FetchLabelsOptions): Promise<Label
 // that loads before the configure() call is harmless.
 
 let _server: FlagsClient | null = null;
-// Remembered from the FIRST shipeasy() call, used as a default for later calls
-// in the same request that omit `clientKey` (e.g. page.tsx after layout.tsx).
-// Without this, a `shipeasy({ apiKey: SERVER_KEY })` in the page would call
-// `i18n.init` with the server key, which the `/sdk/i18n/strings` endpoint
-// rejects with 401 — and SSR translations silently disappear.
-let _rememberedClientKey: string | null = null;
 
 export function configureShipeasyServer(opts: FlagsClientOptions): FlagsClient {
   if (_server) return _server;
@@ -737,20 +731,15 @@ export function _resetShipeasyServerForTests(): void {
 
 export interface ShipeasyServerConfig {
   /**
-   * Server-side API key — authenticates flag/experiment fetches from the edge
-   * (requireKey("server")). Never embedded in browser output. If omitted, flag
-   * and experiment evaluation is skipped and an error is logged — it is NOT
-   * substituted with clientKey (a client key 401s against /sdk/flags).
+   * Server key — the ONLY key the server entrypoint accepts. Authenticates
+   * flag/experiment fetches (requireKey("server")) AND SSR i18n string fetches
+   * (the /sdk/i18n/strings route accepts the server key for server-side use).
+   * Never embedded in browser output. The browser uses its own client key via
+   * `shipeasy({ clientKey })` from `@shipeasy/sdk/client` — the server never
+   * sees or forwards the client key. If omitted, flag/experiment/i18n loading
+   * is skipped and an error is logged.
    */
-  apiKey?: string;
-  /**
-   * Public client key — embedded in window.__SE_BOOTSTRAP and used by the
-   * browser SDK, and authenticates i18n string fetches (requireKey("client")).
-   * Safe to expose (e.g. NEXT_PUBLIC_ env vars). If omitted, i18n loading is
-   * skipped and an error is logged — it is NOT substituted with apiKey (a
-   * server key 401s against /sdk/i18n/strings).
-   */
-  clientKey?: string;
+  serverKey?: string;
   /** Raw URL or query string for applying ?se_ks_* / ?se_cf_* / ?se_exp_* overrides. */
   urlOverrides?: string;
   /** User attributes for flag and experiment evaluation. */
@@ -774,36 +763,25 @@ export interface ShipeasyServerHandle {
  * payloads and i18n falls back to hardcoded strings.
  */
 export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServerHandle> {
-  // Server and client keys are NOT interchangeable. /sdk/flags and
-  // /sdk/experiments enforce requireKey("server"); /sdk/i18n/strings enforces
-  // requireKey("client"). Substituting one type for the other is never a
-  // graceful fallback — it's a request that cannot succeed (guaranteed 401) and
-  // it masks the real misconfig (a missing key silently becomes a phantom 401).
-  // So: no cross-type fallback. If the key an operation needs is absent, skip
-  // that operation and log a loud, actionable error instead of firing a doomed
-  // request.
-  const apiKey = opts.apiKey ?? "";
-  const clientKey = opts.clientKey ?? _rememberedClientKey ?? "";
-  if (opts.clientKey && !_rememberedClientKey) _rememberedClientKey = opts.clientKey;
-  if (!apiKey) {
+  // The server entrypoint uses ONE key: the server key. It authenticates
+  // /sdk/flags + /sdk/experiments (requireKey("server")) and SSR i18n
+  // (/sdk/i18n/strings now accepts the server key for server-side use). The
+  // client key never reaches the server — the browser configures itself with
+  // its own client key via `shipeasy({ clientKey })` from @shipeasy/sdk/client.
+  // If the server key is missing, skip every fetch and log a loud, actionable
+  // error rather than firing a doomed request.
+  const serverKey = opts.serverKey ?? "";
+  if (!serverKey) {
     console.error(
-      "[shipeasy] No server key — flags & experiments skipped. Pass `apiKey` to " +
-        "shipeasy() with your server key (SHIPEASY_SERVER_KEY). Set it as a Worker " +
-        "secret with `wrangler secret put SHIPEASY_SERVER_KEY` (or add it to .env for " +
-        "local dev). Do not pass a client key here — /sdk/flags requires a server key " +
-        "and will 401.",
-    );
-  }
-  if (!clientKey) {
-    console.error(
-      "[shipeasy] No client key — i18n strings skipped, falling back to hardcoded text. " +
-        "Pass `clientKey` to shipeasy() with your public client key " +
-        "(NEXT_PUBLIC_SHIPEASY_CLIENT_KEY). Do not pass a server key here — " +
-        "/sdk/i18n/strings requires a client key and will 401.",
+      "[shipeasy] No server key — flags, experiments and SSR i18n skipped. Pass " +
+        "`serverKey` to shipeasy() from @shipeasy/sdk/server with your server key " +
+        "(SHIPEASY_SERVER_KEY). Set it as a Worker secret with " +
+        "`wrangler secret put SHIPEASY_SERVER_KEY` (or add it to .env for local dev). " +
+        "Do not pass a client key here — the server entrypoint only accepts the server key.",
     );
   }
   const profile = opts.i18nDefaultProfile ?? "en:prod";
-  flags.configure({ apiKey });
+  flags.configure({ apiKey: serverKey });
   // Resolve URL overrides: explicit opts.urlOverrides wins; otherwise try
   // (a) the x-se-search header (injected by middleware when one is wired up)
   // and (b) the `se_edit_labels` cookie that the inline patcher sets on the
@@ -842,8 +820,8 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     : false;
   (globalThis as Record<symbol, unknown>)[_EDIT_MODE_SSR_SYM] = editLabels;
   await Promise.allSettled([
-    apiKey ? flags.initOnce() : Promise.resolve(),
-    clientKey ? i18n.init(clientKey, profile) : Promise.resolve(),
+    serverKey ? flags.initOnce() : Promise.resolve(),
+    serverKey ? i18n.init(serverKey, profile) : Promise.resolve(),
   ]);
 
   const bootstrap = flags.evaluate(opts.user ?? {}, resolvedUrlOverrides);
@@ -855,7 +833,6 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     experiments: bootstrap.experiments,
     getBootstrapHtml() {
       return getBootstrapHtml(bootstrap, i18nData, {
-        apiKey: clientKey,
         editLabels,
         i18nProfile: profile,
       });
@@ -866,24 +843,25 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
 // ---- Framework-agnostic bootstrap script helper ----
 
 export interface BootstrapHtmlOptions {
-  /** SDK client key */
-  apiKey: string;
-  /** i18n profile fed to the loader script. Defaults to "en:prod". */
+  /** i18n profile recorded in the bootstrap so the client loader matches SSR. Defaults to "en:prod". */
   i18nProfile?: string;
   /** When true, tEl() embeds label markers so the devtools can highlight them. */
   editLabels?: boolean;
 }
 
 /**
- * Returns a vanilla-JS script string for a single <script> tag.
- * Handles everything the client needs at startup:
+ * Returns a vanilla-JS string for a single inline <script> tag. Handles
+ * everything the client needs at startup EXCEPT the key — no SDK key is ever
+ * embedded here (the server only knows the server key, which must stay
+ * server-side). The browser supplies its own client key via
+ * `shipeasy({ clientKey })` from @shipeasy/sdk/client, which also injects the
+ * runtime i18n loader. This script emits:
  *   - window.__se_devtools_config (when devtoolsAdminUrl is set)
- *   - window.__SE_BOOTSTRAP (flags + configs + experiments + i18n + apiKey for auto-init)
- *   - window.i18n shim from SSR strings (prevents hydration mismatches)
- *   - dynamic <script> injection for the i18n loader
+ *   - window.__SE_BOOTSTRAP (flags + configs + experiments + i18n DATA + i18nProfile, NO key)
+ *   - window.i18n shim from SSR strings (prevents hydration mismatches / FOUC)
+ *   - devtools overlay loader when ?se / ?se_devtools is present
  *
  * Framework-agnostic: set innerHTML on a <script> element, nothing else required.
- * Pass null for bootstrap on pages without flag evaluation — client still auto-inits.
  */
 export function getBootstrapHtml(
   bootstrap: BootstrapPayload | null,
@@ -898,7 +876,9 @@ export function getBootstrapHtml(
     flags: bootstrap?.flags ?? {},
     configs: bootstrap?.configs ?? {},
     experiments: bootstrap?.experiments ?? {},
-    apiKey: opts.apiKey,
+    // No key here — the server only knows the server key, which must never reach
+    // the browser. The client supplies its own client key via shipeasy({ clientKey }).
+    i18nProfile: profile,
     apiUrl,
   };
   if (i18nData) payload.i18n = i18nData;
@@ -960,13 +940,12 @@ export function getBootstrapHtml(
     );
   }
 
-  parts.push(
-    `(function(){var s=document.createElement('script');` +
-      `s.src=${JSON.stringify(`${apiUrl}/sdk/i18n/loader.js`)};` +
-      `s.setAttribute('data-key',${JSON.stringify(opts.apiKey)});` +
-      `s.setAttribute('data-profile',${JSON.stringify(profile)});` +
-      `document.head.appendChild(s);})();`,
-  );
+  // NOTE: the runtime i18n loader (<script src=.../sdk/i18n/loader.js data-key>)
+  // is NO LONGER injected here. It needs the client key, which the server does
+  // not hold. The client entrypoint (`shipeasy({ clientKey })` in
+  // @shipeasy/sdk/client) injects the loader with its own client key. The SSR
+  // i18n shim above already populates window.i18n for first paint, so there is
+  // no untranslated flash before the client loader takes over.
 
   // Load devtools overlay when ?se (or ?se_devtools) is present in the URL.
   parts.push(

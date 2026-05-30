@@ -1,5 +1,46 @@
 # Changelog
 
+## 3.0.0
+
+### Breaking
+
+- **Each entrypoint takes exactly one, separately-named key. No cross-type fallback,
+  no key shared between server and browser.**
+  - `@shipeasy/sdk/server` `shipeasy()` now takes **`serverKey`** (was `apiKey`),
+    and no longer accepts `clientKey`. The server key authenticates flags,
+    experiments **and** SSR i18n (`/sdk/i18n/strings` now accepts a server key for
+    server-side use). The server never sees or forwards a client key.
+  - `@shipeasy/sdk/client` `shipeasy()` now takes **`clientKey`** (was `apiKey`).
+    The browser uses only the client key, for `/sdk/evaluate`, `/collect`, and the
+    runtime i18n loader.
+  - **No SDK key is embedded in `window.__SE_BOOTSTRAP` anymore.** The bootstrap
+    carries flags/configs/experiments/i18n DATA + `i18nProfile` only — never a key,
+    so the server key can never leak to the browser. Consequently the implicit
+    "auto-init from the bootstrap key" is **removed**: the browser must initialise
+    explicitly with `shipeasy({ clientKey })`.
+  - The runtime i18n loader (`/sdk/i18n/loader.js`) is now injected by the **client**
+    `shipeasy({ clientKey })` call, not by the server's `getBootstrapHtml()`.
+    `getBootstrapHtml()`'s `apiKey` option is removed; the SSR i18n shim it emits
+    still prevents an untranslated first-paint.
+
+  Migration:
+  ```diff
+  // server (root layout)
+  - await shipeasy({ apiKey: process.env.SHIPEASY_SERVER_KEY, clientKey: process.env.NEXT_PUBLIC_SHIPEASY_CLIENT_KEY });
+  + await shipeasy({ serverKey: process.env.SHIPEASY_SERVER_KEY });
+
+  // client (a "use client" component, once at startup)
+  - shipeasy({ apiKey: process.env.NEXT_PUBLIC_SHIPEASY_CLIENT_KEY });
+  + shipeasy({ clientKey: process.env.NEXT_PUBLIC_SHIPEASY_CLIENT_KEY });
+  ```
+
+  Why: server and client keys validate against different namespaces and the edge
+  routes enforce the type, so substituting one for the other (the old `apiKey ??
+  clientKey` fallback) could only ever produce guaranteed-401 traffic that masked a
+  real missing-key misconfig. Naming each key for its side and forbidding the
+  fallback makes misconfiguration loud and keeps the server key off the wire to the
+  browser.
+
 ## 2.5.2
 
 ### Fixed

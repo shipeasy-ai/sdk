@@ -939,12 +939,23 @@ let _client: FlagsClientBrowser | null = null;
 // ---- Unified top-level configure API ----
 
 export interface ShipeasyClientConfig {
-  /** SDK key — same value used on the server via shipeasy(). */
-  apiKey: string;
+  /**
+   * Public client key — the ONLY key the browser entrypoint accepts. Authenticates
+   * /sdk/evaluate, /collect and the runtime i18n loader (/sdk/i18n/strings). Safe to
+   * expose (e.g. NEXT_PUBLIC_ env vars). This is a different key from the server key
+   * passed to `shipeasy({ serverKey })` in @shipeasy/sdk/server — never use the
+   * server key here.
+   */
+  clientKey: string;
   /** Override the ShipEasy CDN/edge base URL. Defaults to https://cdn.shipeasy.ai. */
   baseUrl?: string;
   /** Override the admin URL for the devtools overlay (dev use). */
   adminUrl?: string;
+  /**
+   * i18n profile for the runtime string loader, e.g. "en:prod". Defaults to the
+   * profile the server recorded in window.__SE_BOOTSTRAP, then "en:prod".
+   */
+  i18nProfile?: string;
   /**
    * Skip the lazy auto-identify({}) at boot. Defaults to true (auto-identify on).
    * Turn off when the host has its own identify orchestration and wants to
@@ -960,9 +971,9 @@ export interface ShipeasyClientConfig {
    * Pass `false` to disable everything, or a per-group object to narrow:
    *
    * ```ts
-   * shipeasy({ apiKey, autoCollect: false });                  // off
-   * shipeasy({ apiKey, autoCollect: { errors: false } });      // vitals + engagement only
-   * shipeasy({ apiKey });                                      // all groups on
+   * shipeasy({ clientKey, autoCollect: false });               // off
+   * shipeasy({ clientKey, autoCollect: { errors: false } });   // vitals + engagement only
+   * shipeasy({ clientKey });                                   // all groups on
    * ```
    */
   autoCollect?: boolean | Partial<AutoCollectGroups>;
@@ -983,12 +994,17 @@ export function shipeasy(opts: ShipeasyClientConfig): () => void {
   const blanket = ac === false ? false : true;
   const groups: Partial<AutoCollectGroups> | undefined =
     ac && typeof ac === "object" ? ac : undefined;
+  const baseUrl = opts.baseUrl ?? "https://cdn.shipeasy.ai";
   const client = configureShipeasy({
-    sdkKey: opts.apiKey,
-    baseUrl: opts.baseUrl ?? "https://cdn.shipeasy.ai",
+    sdkKey: opts.clientKey,
+    baseUrl,
     autoGuardrails: blanket,
     autoGuardrailGroups: groups,
   });
+  // Inject the runtime i18n loader with the client key. The server no longer
+  // does this (it doesn't hold the client key); the SSR shim in __SE_BOOTSTRAP
+  // covers first paint, then this loader fetches fresh strings client-side.
+  injectI18nLoader(opts.clientKey, baseUrl, opts.i18nProfile);
   flags.notifyMounted();
   if (opts.autoIdentify !== false) {
     void client.identify({}).catch((err) => {
@@ -1016,6 +1032,32 @@ export function getShipeasyClient(): FlagsClientBrowser | null {
 export function _resetShipeasyForTests(): void {
   _client?.destroy();
   _client = null;
+  _i18nLoaderInjected = false;
+}
+
+let _i18nLoaderInjected = false;
+
+/**
+ * Inject the CDN i18n loader (<script src=.../sdk/i18n/loader.js data-key data-profile>)
+ * which fetches profile strings at runtime and installs window.i18n. Owned by the
+ * client entrypoint because it carries the client key; the server never injects it.
+ * Idempotent — only the first call per page wins.
+ */
+function injectI18nLoader(clientKey: string, baseUrl: string, profileOpt?: string): void {
+  if (_i18nLoaderInjected || typeof document === "undefined") return;
+  if (!clientKey || typeof document.createElement !== "function" || !document.head) return;
+  _i18nLoaderInjected = true;
+  try {
+    const bs = getBootstrap();
+    const profile = profileOpt ?? bs?.i18nProfile ?? "en:prod";
+    const s = document.createElement("script");
+    s.src = `${baseUrl}/sdk/i18n/loader.js`;
+    s.setAttribute("data-key", clientKey);
+    s.setAttribute("data-profile", profile);
+    document.head.appendChild(s);
+  } catch {
+    /* non-DOM runtime or partial document — i18n loader is optional */
+  }
 }
 
 // Bootstrap payload injected by the server via `window.__SE_BOOTSTRAP`.
@@ -1034,8 +1076,8 @@ export interface BootstrapPayload {
    * the killswitch is not whole-killed and the map carries per-switch state.
    */
   killswitches?: Record<string, boolean | Record<string, boolean>>;
-  /** Set by getBootstrapHtml() for auto-init. Not part of evaluate() output. */
-  apiKey?: string;
+  /** i18n profile the server rendered with, so the client loader matches. No key is embedded. */
+  i18nProfile?: string;
   apiUrl?: string;
   /** When true, tEl() returns marker-wrapped strings for devtools label editing. */
   editLabels?: boolean;
@@ -1582,12 +1624,10 @@ export const i18n: I18nFacade = {
   },
 };
 
-// Auto-init from window.__SE_BOOTSTRAP.apiKey when the bundle loads.
-// The inline bootstrap script (written by getBootstrapHtml) always runs before
-// deferred/module JS bundles, so __SE_BOOTSTRAP is present by the time this runs.
-if (typeof window !== "undefined") {
-  const _initBs = (window as unknown as { __SE_BOOTSTRAP?: BootstrapPayload }).__SE_BOOTSTRAP;
-  if (_initBs?.apiKey && !_client) {
-    shipeasy({ apiKey: _initBs.apiKey, baseUrl: _initBs.apiUrl });
-  }
-}
+// No key-based auto-init: the server no longer embeds a key in __SE_BOOTSTRAP
+// (it only holds the server key, which must stay server-side). The browser must
+// initialise explicitly with its own client key:
+//   import { shipeasy } from "@shipeasy/sdk/client";
+//   shipeasy({ clientKey: process.env.NEXT_PUBLIC_SHIPEASY_CLIENT_KEY ?? "" });
+// __SE_BOOTSTRAP still provides flags/configs/experiments/i18n DATA for first
+// paint; readers fall back to safe defaults until shipeasy({ clientKey }) runs.
