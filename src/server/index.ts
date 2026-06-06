@@ -517,11 +517,20 @@ const _i18nALS = new AsyncLocalStorage<I18nStore>();
 // SSR and edge layers), we also park them on a registry-shared globalThis Map
 // keyed by profile. ALS is still the read fast path; the global Map is the
 // fallback when an async resource boundary blanked the store.
+//
+// Each entry carries `fetchedAt` so the cache expires: without it, the first
+// successful fetch pins the strings for the lifetime of the (potentially
+// long-lived) worker isolate, so an admin edit to a label never becomes visible
+// — the SSR bootstrap keeps embedding the stale value. The TTL mirrors the
+// `next: { revalidate: 60 }` on the underlying fetch, so a published change
+// propagates within ~60s instead of "never until the isolate recycles".
 const _I18N_CACHE_SYM = Symbol.for("@shipeasy/sdk:ssr-i18n-cache");
-type I18nCache = Map<string, I18nStore>;
+const I18N_CACHE_TTL_MS = 60_000;
+type CachedI18n = I18nStore & { fetchedAt: number };
+type I18nCache = Map<string, CachedI18n>;
 const _i18nCache: I18nCache =
   ((globalThis as Record<symbol, unknown>)[_I18N_CACHE_SYM] as I18nCache | undefined) ??
-  ((globalThis as Record<symbol, unknown>)[_I18N_CACHE_SYM] = new Map<string, I18nStore>());
+  ((globalThis as Record<symbol, unknown>)[_I18N_CACHE_SYM] = new Map<string, CachedI18n>());
 
 // Register i18n getter into global symbol so the client module can read it
 // during SSR without importing this server module. Read order:
@@ -615,18 +624,32 @@ export const i18n = {
     // Skip if THIS request's ALS already has loaded strings.
     const existingALS = _i18nALS.getStore();
     if (existingALS && Object.keys(existingALS.strings).length > 0) return;
-    // Skip the fetch if the global cache already has it (any prior request, or
-    // a sibling Server Component in this request that ran first with a good
-    // key). Still call enterWith so this async ctx's getStore() works.
+    // Skip the fetch if the global cache has a *fresh* entry (any prior request,
+    // or a sibling Server Component in this request that ran first with a good
+    // key). Still call enterWith so this async ctx's getStore() works. Entries
+    // older than the TTL fall through to a re-fetch so published edits surface.
     const cached = _i18nCache.get(profile);
-    if (cached && Object.keys(cached.strings).length > 0) {
+    if (
+      cached &&
+      Object.keys(cached.strings).length > 0 &&
+      Date.now() - cached.fetchedAt < I18N_CACHE_TTL_MS
+    ) {
       _i18nALS.enterWith(cached);
       return;
     }
     const labels = await fetchLabelsForSSR({ key, profile, cdnBaseUrl }).catch(() => null);
     const locale = profile.split(":")[0] || "en";
     const store: I18nStore = { strings: labels?.strings ?? {}, locale };
-    if (Object.keys(store.strings).length > 0) _i18nCache.set(profile, store);
+    if (Object.keys(store.strings).length > 0) {
+      _i18nCache.set(profile, { ...store, fetchedAt: Date.now() });
+    } else if (cached && Object.keys(cached.strings).length > 0) {
+      // Re-fetch failed (network blip / transient 5xx) but we still hold a stale
+      // entry — keep serving it rather than regressing to key fallbacks. Leave
+      // its timestamp so the next request retries instead of pinning the stale
+      // copy for another full TTL.
+      _i18nALS.enterWith(cached);
+      return;
+    }
     _i18nALS.enterWith(store);
   },
 

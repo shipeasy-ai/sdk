@@ -724,3 +724,78 @@ describe("server shipeasy() — single server key, no client key", () => {
     expect(html).not.toContain("apiKey");
   });
 });
+
+describe("server i18n SSR cache TTL", () => {
+  // The cache is parked on globalThis (shared across module re-imports), so it
+  // persists between vi.resetModules() runs the way it persists across requests
+  // in a long-lived worker isolate. Clear it explicitly between tests.
+  const CACHE_SYM = Symbol.for("@shipeasy/sdk:ssr-i18n-cache");
+  const clearCache = () =>
+    (globalThis as Record<symbol, { clear?: () => void }>)[CACHE_SYM]?.clear?.();
+
+  beforeEach(() => {
+    clearCache();
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    clearCache();
+  });
+
+  function stubFetchWithStrings(): string[] {
+    const calls: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      calls.push(u);
+      const isI18n = u.includes("/sdk/i18n");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          version: "v1",
+          plan: "free",
+          gates: {},
+          configs: {},
+          universes: {},
+          experiments: {},
+          locale: "en",
+          // Only the i18n response carries strings — an empty result is never
+          // cached, so the cache only populates on a real string payload.
+          strings: isI18n ? { greeting: "hello" } : {},
+        }),
+      } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return calls;
+  }
+
+  // Each run gets a fresh module instance (fresh ALS, fresh flags singleton) but
+  // shares the globalThis string cache — mirroring a new SSR request landing on
+  // the same isolate.
+  async function runShipeasy() {
+    vi.resetModules();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { shipeasy } = await import("../server");
+    await shipeasy({ serverKey: "srv_key_ttl" });
+  }
+
+  const i18nCount = (calls: string[]) => calls.filter((u) => u.includes("/sdk/i18n")).length;
+
+  it("serves cached strings within the TTL, then re-fetches once it expires", async () => {
+    const calls = stubFetchWithStrings();
+
+    await runShipeasy();
+    expect(i18nCount(calls)).toBe(1); // first request fetches + caches
+
+    vi.setSystemTime(30_000); // within the 60s TTL
+    await runShipeasy();
+    expect(i18nCount(calls)).toBe(1); // cache hit — no new fetch
+
+    vi.setSystemTime(61_000); // past the TTL
+    await runShipeasy();
+    expect(i18nCount(calls)).toBe(2); // stale entry expired — re-fetched
+  });
+});

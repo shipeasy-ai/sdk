@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.0.1
+
+### Fixed
+
+- **SSR i18n strings no longer pin to the first fetch for the life of the worker
+  isolate.** The per-profile `_i18nCache` that backs `i18n.init()` had no
+  expiry, so once a profile's strings were fetched, every later server render
+  reused them — an admin label edit (e.g. devtools "Apply changes", or a
+  dashboard publish) updated D1/KV/CDN but the SSR bootstrap kept embedding the
+  stale value, so the page never showed the new copy. Cache entries now carry a
+  `fetchedAt` timestamp and expire after 60s (matching the `next: { revalidate:
+  60 }` on the underlying fetch), so published changes surface within ~60s. A
+  failed re-fetch keeps serving the last-known strings rather than regressing to
+  key fallbacks.
+
 ## 3.0.0
 
 ### Breaking
