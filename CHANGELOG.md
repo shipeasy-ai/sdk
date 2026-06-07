@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.1.0
+
+### Added
+
+- **Per-evaluation usage telemetry.** Every `getFlag` / `getConfig` /
+  `getExperiment` / `getKillswitch` call (server and browser) fires one
+  fire-and-forget beacon (`sendBeacon` in the browser, non-awaited `fetch` on the
+  server) to the usage host, so usage is counted by Cloudflare's native per-path
+  analytics with zero per-request storage. The path carries `sha256(key)` (never
+  the raw key), plus `side`/`env`/`feature`/`resource`. A 2s dedup window
+  collapses repeated reads of the same key. ON by default; opt out with
+  `disableTelemetry`.
+
 ## 3.0.1
 
 ### Fixed
