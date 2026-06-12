@@ -15,6 +15,8 @@ export const SEE_MAX_STACK = 8000;
 export const SEE_MAX_SUBJECT = 200;
 export const SEE_MAX_EXTRA_VALUE = 200;
 export const SEE_MAX_EXTRA_KEYS = 20;
+/** Correlation token length cap — bounds the join keyspace. Mirrored server-side. */
+export const SEE_MAX_CORRELATION = 64;
 export const SEE_DEDUP_WINDOW_MS = 30_000;
 export const SEE_MAX_PER_SESSION = 25;
 
@@ -78,6 +80,16 @@ export interface SeeErrorEvent {
   env?: string;
   sdk_version: string;
   ts: number;
+  /**
+   * Per-request correlation token. The client mints one per same-origin fetch
+   * and ships it on both the request header (`X-SE-Correlation`) and any 5xx
+   * occurrence it reports; the server safety net reports the matching uncaught
+   * error under the same token. The backend joins the two issues by it —
+   * populating `caused_by` across the network boundary, where the in-process
+   * `.cause`-chain stamp (see `findCausedBy`) cannot reach. Join-only metadata,
+   * never persisted as an issue field.
+   */
+  correlation_id?: string;
   /**
    * The earlier reported problem this occurrence descends from — present when
    * the same error was caught + reported at an inner boundary and then
@@ -280,6 +292,7 @@ export function buildSeeEvent(
   extras: SeeExtras | undefined,
   ctx: SeeContext,
   kindOverride?: SeeKind,
+  correlationId?: string,
 ): SeeErrorEvent {
   let errorType: string;
   let message: string;
@@ -316,6 +329,7 @@ export function buildSeeEvent(
     ts: Date.now(),
   };
   if (stack) ev.stack = truncate(stack, SEE_MAX_STACK);
+  if (correlationId) ev.correlation_id = truncate(String(correlationId), SEE_MAX_CORRELATION);
   // Discover the cause BEFORE stamping this problem — otherwise the re-throw
   // case (same object reported twice) would read its own fresh stamp.
   const causedBy = findCausedBy(problem);

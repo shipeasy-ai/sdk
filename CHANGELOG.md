@@ -1,5 +1,29 @@
 # Changelog
 
+## 4.3.0
+
+### Added
+
+- **Cross-runtime error correlation (`caused_by` across the network boundary).**
+  The in-process `.cause`-chain stamp can't link a browser error to its server
+  cause. The client now mints a per-request correlation token, sends it up on
+  the `X-SE-Correlation` header (**same-origin only** — a custom header would
+  force a CORS preflight on cross-origin fetches), and ships it on any 5xx it
+  auto-captures. A server boundary that reports the matching uncaught error
+  under the same token lets the backend join the two issues by correlation,
+  populating `caused_by` across the boundary.
+- **Ambient server correlation** via a new exported `seeContext`
+  (`AsyncLocalStorage`). `reportError` reads the token from it automatically, so
+  server `see()` stays vanilla — no caller ever passes a correlation id. Seed it
+  once in a server error boundary (e.g. Next's `onRequestError`) with
+  `seeContext.run({ correlationId }, () => see(error)…)`.
+- `isExpected` is now re-exported from `@shipeasy/sdk/server` so a server error
+  boundary can skip errors a handler already reported + marked via
+  `see.ControlFlowException`.
+- `correlation_id` added to the `SeeErrorEvent` wire shape (join-only metadata;
+  never persisted as an issue field). `buildSeeEvent` takes an optional
+  `correlationId` argument.
+
 ## 4.2.0
 
 ### Changed (behavioral)

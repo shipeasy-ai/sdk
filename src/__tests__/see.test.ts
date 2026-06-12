@@ -149,6 +149,20 @@ describe("buildSeeEvent", () => {
     expect(ev.user_id).toBe("u1");
     expect(ev.anonymous_id).toBe("anon1");
   });
+
+  it("attaches a correlation id when passed, omits it otherwise", () => {
+    const withId = buildSeeEvent(
+      new Error("x"),
+      causesThe("a").to("b"),
+      undefined,
+      CTX,
+      undefined,
+      "corr-abc-123",
+    );
+    expect(withId.correlation_id).toBe("corr-abc-123");
+    const withoutId = buildSeeEvent(new Error("x"), causesThe("a").to("b"), undefined, CTX);
+    expect(withoutId.correlation_id).toBeUndefined();
+  });
 });
 
 describe("caused-by linkage (findCausedBy / markReported / buildSeeEvent)", () => {
@@ -536,6 +550,36 @@ describe("client see() wiring", () => {
 
 // ---- server facade ----
 
+describe("client correlation helpers (sameOrigin / injectCorrelationHeader)", () => {
+  beforeEach(() => vi.resetModules());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("sameOrigin: same-origin + relative URLs true, cross-origin + junk false", async () => {
+    vi.stubGlobal("location", { href: "https://app.test/x", origin: "https://app.test" });
+    const { sameOrigin } = await import("../client/index");
+    expect(sameOrigin("/cli-auth")).toBe(true);
+    expect(sameOrigin("https://app.test/api/orders")).toBe(true);
+    expect(sameOrigin("https://evil.test/api")).toBe(false);
+    expect(sameOrigin("//evil.test/api")).toBe(false); // protocol-relative cross-origin
+  });
+
+  it("injectCorrelationHeader preserves existing headers across arg shapes", async () => {
+    const { injectCorrelationHeader } = await import("../client/index");
+    // string + init shape
+    const [, init] = injectCorrelationHeader(["/x", { headers: { "X-Existing": "1" } }], "corr-1");
+    const h1 = new Headers((init as RequestInit).headers);
+    expect(h1.get("X-SE-Correlation")).toBe("corr-1");
+    expect(h1.get("X-Existing")).toBe("1");
+    // Request shape — header added, original headers kept, original untouched.
+    const original = new Request("https://app.test/x", { headers: { "X-Existing": "2" } });
+    const reqArgs = injectCorrelationHeader([original], "corr-2");
+    const req0 = reqArgs[0] as Request;
+    expect(req0.headers.get("X-SE-Correlation")).toBe("corr-2");
+    expect(req0.headers.get("X-Existing")).toBe("2");
+    expect(original.headers.get("X-SE-Correlation")).toBeNull();
+  });
+});
+
 describe("server see() wiring", () => {
   beforeEach(() => vi.resetModules());
   afterEach(() => {
@@ -608,5 +652,35 @@ describe("server see() wiring", () => {
     expect(() => mod.see(new Error("x")).causes_the("a").to("b")).not.toThrow();
     await tick();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("see() called before"));
+  });
+
+  it("auto-attaches the ambient seeContext correlation id; vanilla see() outside a scope omits it", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 202 });
+    vi.stubGlobal("fetch", fetchMock);
+    const mod = await import("../server/index");
+    mod._resetShipeasyServerForTests();
+    mod.flags.configure({
+      apiKey: "sk_test",
+      baseUrl: "https://edge.test",
+      disableTelemetry: true,
+    });
+    // Inside a seeContext.run scope — the id rides along via the ALS the SDK
+    // reads in reportError, even though dispatch is deferred to a microtask.
+    mod.seeContext.run({ correlationId: "corr-xyz-789" }, () => {
+      mod
+        .see(new Error("worker 502"))
+        .causes_the("CLI authorization")
+        .to("fail before the token is issued");
+    });
+    await tick();
+    const inScope = JSON.parse(fetchMock.mock.calls[0][1].body).events[0];
+    expect(inScope.correlation_id).toBe("corr-xyz-789");
+    // Vanilla see() outside any scope — no correlation id. (Distinct
+    // message/subject so the dedup limiter still lets it send.)
+    mod.see(new Error("unrelated")).causes_the("report").to("render empty");
+    await tick();
+    const outScope = JSON.parse(fetchMock.mock.calls[1][1].body).events[0];
+    expect(outScope.correlation_id).toBeUndefined();
+    mod._resetShipeasyServerForTests();
   });
 });

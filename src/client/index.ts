@@ -262,6 +262,7 @@ type SeeReporter = (
   consequence: Consequence,
   extras: SeeExtras | undefined,
   kind: SeeKind,
+  correlationId?: string,
 ) => void;
 
 /**
@@ -291,6 +292,43 @@ function endpointTemplate(rawUrl: string): string {
     .join("/");
   const sameOrigin = typeof location !== "undefined" && u.origin === location.origin;
   return ((sameOrigin ? "" : u.host) + path).slice(0, 120);
+}
+
+/** True when `rawUrl` resolves to the page's own origin (relative URLs included). */
+export function sameOrigin(rawUrl: string): boolean {
+  if (typeof location === "undefined") return false;
+  try {
+    return new URL(rawUrl, location.href).origin === location.origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Return a new `fetch` args tuple with `X-SE-Correlation` added, preserving any
+ * existing headers across all three arg shapes (string / URL / Request). Never
+ * mutates the caller's objects. Best-effort: on any failure the original args
+ * pass through unchanged (correlation is optional, never breaks the fetch).
+ */
+export function injectCorrelationHeader(
+  args: Parameters<typeof fetch>,
+  corr: string,
+): Parameters<typeof fetch> {
+  try {
+    const input = args[0];
+    if (typeof Request !== "undefined" && input instanceof Request) {
+      const headers = new Headers(input.headers);
+      headers.set("X-SE-Correlation", corr);
+      return [new Request(input, { headers }), ...args.slice(1)] as Parameters<typeof fetch>;
+    }
+    const init = { ...(args[1] ?? {}) };
+    const headers = new Headers(init.headers ?? undefined);
+    headers.set("X-SE-Correlation", corr);
+    init.headers = headers;
+    return [input, init] as Parameters<typeof fetch>;
+  } catch {
+    return args;
+  }
 }
 
 function installAutoGuardrails(
@@ -396,6 +434,16 @@ function installAutoGuardrails(
       // Querystring-free URL for the message (it feeds the issue fingerprint);
       // the full URL still travels in extras for debugging.
       const bareUrl = url.split("?")[0].slice(0, 200);
+      // Per-request correlation token, SAME-ORIGIN ONLY. Sent up on the request
+      // header so a server boundary that reports the matching uncaught error
+      // can echo it; the backend joins the two issues by it. Cross-origin is
+      // skipped on purpose — a custom header would force a CORS preflight on
+      // otherwise-simple third-party fetches and break them.
+      let corr: string | undefined;
+      if (!ignored && sameOrigin(url) && typeof crypto !== "undefined" && crypto.randomUUID) {
+        corr = crypto.randomUUID();
+        args = injectCorrelationHeader(args, corr);
+      }
       let res: Response;
       try {
         res = await origFetch.apply(this, args);
@@ -424,6 +472,7 @@ function installAutoGuardrails(
           causesThe(`request to ${endpointTemplate(url)}`).to("fail with a server error"),
           { status: res.status, url: url.slice(0, 200), duration_ms: Math.round(elapsed) },
           "network",
+          corr,
         );
       }
       return res;
@@ -846,8 +895,8 @@ export class FlagsClientBrowser {
         this.userId,
         this.anonId,
         this.autoGuardrailGroups,
-        (problem, consequence, extras, kind) =>
-          this.reportError(problem, consequence, extras, kind),
+        (problem, consequence, extras, kind, correlationId) =>
+          this.reportError(problem, consequence, extras, kind, correlationId),
         [`${this.baseUrl}/`, DEFAULT_TELEMETRY_URL],
         this.autoCollectAlways,
       );
@@ -865,6 +914,7 @@ export class FlagsClientBrowser {
     consequence: Consequence,
     extras?: SeeExtras,
     kind?: SeeKind,
+    correlationId?: string,
   ): void {
     try {
       // Auto-collected env (env.* keys) goes first; the developer's own
@@ -877,7 +927,7 @@ export class FlagsClientBrowser {
         url: typeof window !== "undefined" && window.location ? window.location.href : undefined,
         userId: this.userId || undefined,
         anonId: this.anonId,
-      }, kind);
+      }, kind, correlationId);
       if (!this.seeLimiter.shouldSend(ev)) return;
       this.buffer.sendNow([ev]);
     } catch {

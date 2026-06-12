@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { Telemetry, DEFAULT_TELEMETRY_URL } from "../telemetry";
 import {
   buildSeeEvent,
+  isExpected,
   markExpected,
   SeeLimiter,
   startSeeChain,
@@ -491,11 +492,14 @@ export class FlagsClient {
     kind?: SeeKind,
   ): void {
     try {
+      // Ambient per-request correlation token (seeded by the safety-net hook).
+      // Read here so `see()` stays vanilla — no caller ever passes an id.
+      const correlationId = seeContext.getStore()?.correlationId;
       const ev = buildSeeEvent(problem, consequence, extras, {
         side: "server",
         sdkVersion: version,
         env: this.env,
-      }, kind);
+      }, kind, correlationId);
       if (!this.seeLimiter.shouldSend(ev)) return;
       globalThis
         .fetch(`${this.baseUrl}/collect`, {
@@ -683,6 +687,31 @@ Object.defineProperty(globalThis, _EDIT_MODE_SSR_SYM, {
   },
   configurable: true,
 });
+
+// see() correlation: a per-request token (minted client-side, sent up on the
+// `X-SE-Correlation` header) parked in ALS so every server `see()` in the
+// request auto-attaches it — joining the client + server issues across the
+// network boundary the in-process `.cause` chain can't cross (see core.ts
+// `findCausedBy`). Parked on a registry-shared Symbol so all of Next's bundle
+// layers (RSC / SSR / edge / instrumentation) share ONE instance: the
+// safety-net hook seeds it via `seeContext.run(...)`, `reportError` reads it.
+// `run()` is used (not `enterWith`, which workerd lacks).
+interface SeeCorrelationStore {
+  correlationId?: string;
+}
+const _SEE_CORR_ALS_SYM = Symbol.for("@shipeasy/sdk:see-correlation-als");
+type GlobalWithSeeALS = Record<symbol, unknown> & {
+  [_SEE_CORR_ALS_SYM]?: AsyncLocalStorage<SeeCorrelationStore>;
+};
+export const seeContext: AsyncLocalStorage<SeeCorrelationStore> =
+  ((globalThis as GlobalWithSeeALS)[_SEE_CORR_ALS_SYM] as
+    | AsyncLocalStorage<SeeCorrelationStore>
+    | undefined) ??
+  ((globalThis as GlobalWithSeeALS)[_SEE_CORR_ALS_SYM] = new AsyncLocalStorage<SeeCorrelationStore>());
+
+// Re-exported so a server error boundary (e.g. Next's onRequestError) can skip
+// errors a handler already reported + marked via see.ControlFlowException.
+export { isExpected };
 
 export interface I18nForRequest {
   strings: Record<string, string>;
