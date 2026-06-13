@@ -67,8 +67,29 @@ describe("murmur3 hash vectors — known values from 04-evaluation.md", () => {
     expect(client.getFlag("g", { user_id: "anyone" })).toBe(true);
   });
 
-  it("no user_id or anonymous_id → false", () => {
+  it("no unit id + rollout=10000 → true (fully-rolled gate needs no bucketing)", () => {
+    // An unidentified request (e.g. SSR before any anon id is minted) still gets
+    // a 100% gate: it's on for everyone, so it's answerable without a unit.
     const gate = { rules: [], rolloutPct: 10000, salt: "s", enabled: 1 as const };
+    const client = makeClient({ gates: { g: gate } }, { universes: {}, experiments: {} });
+    expect(client.getFlag("g", {})).toBe(true);
+  });
+
+  it("no unit id + fractional rollout → false (can't bucket without a unit)", () => {
+    const gate = { rules: [], rolloutPct: 5000, salt: "s", enabled: 1 as const };
+    const client = makeClient({ gates: { g: gate } }, { universes: {}, experiments: {} });
+    expect(client.getFlag("g", {})).toBe(false);
+  });
+
+  it("no unit id + rollout=10000 but failing rule → false", () => {
+    // Rules are evaluated before the no-unit short-circuit, so targeting still
+    // gates a 100% rollout.
+    const gate = {
+      rules: [{ attr: "plan", op: "eq" as const, value: "pro" }],
+      rolloutPct: 10000,
+      salt: "s",
+      enabled: 1 as const,
+    };
     const client = makeClient({ gates: { g: gate } }, { universes: {}, experiments: {} });
     expect(client.getFlag("g", {})).toBe(false);
   });
@@ -722,6 +743,35 @@ describe("server shipeasy() — single server key, no client key", () => {
     const html = handle.getBootstrapHtml();
     expect(html).not.toContain("srv_key_secret");
     expect(html).not.toContain("apiKey");
+  });
+
+  it("mints + bootstraps a __se_anon_id when no user/cookie is present", async () => {
+    vi.resetModules();
+    stubFetchOk();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { shipeasy } = await import("../server");
+    // No next/headers in this runtime → no cookie; server mints one.
+    const handle = await shipeasy({ serverKey: "srv_key" });
+    const html = handle.getBootstrapHtml();
+    // The minted id is both written to the cookie (pre-paint) and exposed in the
+    // bootstrap payload so the browser SDK adopts the exact same bucketing unit.
+    expect(html).toContain("__se_anon_id");
+    expect(html).toMatch(/"anonId":"[^"]+"/);
+    expect(html).toContain("document.cookie");
+  });
+
+  it("buckets against an explicitly-passed user (no anon override)", async () => {
+    vi.resetModules();
+    stubFetchOk();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { shipeasy } = await import("../server");
+    const handle = await shipeasy({
+      serverKey: "srv_key",
+      user: { user_id: "u-123" },
+    });
+    const html = handle.getBootstrapHtml();
+    // Authenticated caller → no anonymous id is minted or emitted.
+    expect(html).not.toMatch(/"anonId":/);
   });
 });
 

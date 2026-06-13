@@ -202,6 +202,25 @@ function matchRule(rule: GateRule, user: User): boolean {
   }
 }
 
+// Cross-SDK identity contract: the stable anonymous bucketing unit lives in a
+// first-party, JS-readable `__se_anon_id` cookie. Every SDK (TS server/client,
+// Ruby, React, future ones) reads this cookie as the default unit so buckets
+// agree across the whole stack. Name + format are frozen — see
+// experiment-platform/18-identity-bucketing.md.
+export const ANON_ID_COOKIE = "__se_anon_id";
+
+// The cookie value is client-controllable, and we both bucket on it and inline
+// it into a bootstrap <script>. Constrain it to an opaque token charset so a
+// tampered cookie can never break out of the script or poison bucketing — a
+// value that fails this is treated as absent (we mint a fresh one instead).
+const ANON_ID_RX = /^[A-Za-z0-9_-]{1,64}$/;
+
+function mintAnonId(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `anon_${Math.random().toString(36).slice(2)}`;
+}
+
 function evalGateInternal(gate: Gate, user: User): boolean {
   if (isEnabled(gate.killswitch)) return false;
   if (!isEnabled(gate.enabled)) return false;
@@ -209,7 +228,11 @@ function evalGateInternal(gate: Gate, user: User): boolean {
     if (!matchRule(rule, user)) return false;
   }
   const uid = user.user_id ?? user.anonymous_id;
-  if (!uid) return false;
+  // No unit id (e.g. an unidentified SSR request before any anon id is minted):
+  // a fully-rolled gate is on for everyone, so it can be answered without
+  // bucketing. A fractional rollout genuinely needs a stable unit to bucket —
+  // deny rather than guess. See experiment-platform/18-identity-bucketing.md.
+  if (!uid) return gate.rolloutPct >= 10000;
   return murmur3(`${gate.salt}:${uid}`) % 10000 < gate.rolloutPct;
 }
 
@@ -965,7 +988,43 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     serverKey ? i18n.init(serverKey, profile) : Promise.resolve(),
   ]);
 
-  const bootstrap = flags.evaluate(opts.user ?? {}, resolvedUrlOverrides);
+  // Resolve the stable anonymous bucketing unit. Precedence:
+  //   1. an explicit user_id from the caller (authenticated) — no anon needed
+  //   2. an explicit anonymous_id from the caller
+  //   3. the `__se_anon_id` cookie — minted by edge middleware on the first
+  //      request (and forwarded to this render via the request headers), or
+  //      persisted by a previous response's bootstrap script
+  //   4. a freshly minted id — defensive fallback for the first request on a
+  //      route middleware doesn't cover; the bootstrap script then persists it
+  // This is the SAME value the browser SDK adopts (cookie / bootstrap), so SSR
+  // and client bucket identically at any rollout %. The cookie name + format are
+  // a cross-SDK contract — see experiment-platform/18-identity-bucketing.md.
+  let anonId: string | undefined;
+  if (!opts.user?.user_id) {
+    if (opts.user?.anonymous_id) {
+      // Explicit caller value — trusted, used verbatim.
+      anonId = opts.user.anonymous_id;
+    } else {
+      try {
+        // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+        // @ts-ignore — next/headers is an optional peer; absent in non-Next.js runtimes
+        const { cookies } = (await import("next/headers")) as {
+          cookies: () =>
+            | Promise<{ get: (n: string) => { value: string } | undefined }>
+            | { get: (n: string) => { value: string } | undefined };
+        };
+        const c = await Promise.resolve(cookies());
+        const raw = c.get?.(ANON_ID_COOKIE)?.value;
+        if (raw && ANON_ID_RX.test(raw)) anonId = raw; // untrusted cookie — validated
+      } catch {}
+      if (!anonId) anonId = mintAnonId(); // no/invalid cookie → fresh id
+    }
+  }
+  const effectiveUser: User = anonId
+    ? { anonymous_id: anonId, ...opts.user }
+    : { ...opts.user };
+
+  const bootstrap = flags.evaluate(effectiveUser, resolvedUrlOverrides);
   const i18nData = i18n.getForRequest();
 
   return {
@@ -976,6 +1035,7 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
       return getBootstrapHtml(bootstrap, i18nData, {
         editLabels,
         i18nProfile: profile,
+        anonId,
       });
     },
   };
@@ -988,6 +1048,14 @@ export interface BootstrapHtmlOptions {
   i18nProfile?: string;
   /** When true, tEl() embeds label markers so the devtools can highlight them. */
   editLabels?: boolean;
+  /**
+   * Stable anonymous bucketing id the server evaluated against. Emitted into
+   * window.__SE_BOOTSTRAP and persisted (pre-paint) to the first-party
+   * `__se_anon_id` cookie, so the browser SDK buckets identically to SSR.
+   * Normally minted by edge middleware; this write is the fallback for routes
+   * middleware doesn't cover. See experiment-platform/18-identity-bucketing.md.
+   */
+  anonId?: string;
 }
 
 /**
@@ -1024,6 +1092,7 @@ export function getBootstrapHtml(
   };
   if (i18nData) payload.i18n = i18nData;
   if (opts.editLabels) payload.editLabels = true;
+  if (opts.anonId) payload.anonId = opts.anonId;
 
   // Edit-labels shim. With ?se_edit_labels=1 the devtools overlay needs every
   // translated string to render as `￹key￺value￻` so it can scan
@@ -1069,6 +1138,20 @@ export function getBootstrapHtml(
   );
 
   parts.push(`window.__SE_BOOTSTRAP=${JSON.stringify(payload)};`);
+
+  // Persist the SSR bucketing id to a first-party cookie when edge middleware
+  // didn't already set it (routes outside the middleware matcher). Pre-paint and
+  // JS-readable (no httpOnly) so the browser SDK adopts the exact id SSR bucketed
+  // against. Skips the write when the cookie is already present.
+  if (opts.anonId) {
+    parts.push(
+      `(function(){try{var k=${JSON.stringify(ANON_ID_COOKIE)},v=${JSON.stringify(opts.anonId)};` +
+        `if(('; '+document.cookie).indexOf('; '+k+'=')===-1){` +
+        `document.cookie=k+'='+v+';path=/;max-age=31536000;samesite=lax'+` +
+        `(location.protocol==='https:'?';secure':'');}` +
+        `}catch(_){}})();`,
+    );
+  }
 
   if (i18nData?.strings && Object.keys(i18nData.strings).length > 0) {
     parts.push(

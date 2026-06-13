@@ -588,18 +588,50 @@ function installAutoGuardrails(
 
 // ---- Anonymous ID ----
 
-function getOrCreateAnonId(): string {
+function readAnonCookie(): string | null {
   try {
-    const stored = localStorage.getItem(ANON_ID_KEY);
-    if (stored) return stored;
+    const m = ("; " + document.cookie).match(/; __se_anon_id=([^;]+)/);
+    return m ? decodeURIComponent(m[1]!) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAnonCookie(id: string): void {
+  try {
+    const secure = location.protocol === "https:" ? ";secure" : "";
+    document.cookie = `${ANON_ID_KEY}=${id};path=/;max-age=31536000;samesite=lax${secure}`;
   } catch {}
-  const id =
-    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
-      ? crypto.randomUUID()
-      : `anon_${Math.random().toString(36).slice(2)}`;
+}
+
+function getOrCreateAnonId(): string {
+  // Precedence is deliberate. The cookie is the id the SERVER bucketed against
+  // this request (set by edge middleware or the SSR bootstrap script), so
+  // adopting it makes the browser bucket identically at any rollout %. The
+  // bootstrap payload carries the same id as a belt-and-suspenders fallback;
+  // localStorage is the legacy store. We mirror the resolved id into BOTH the
+  // cookie and localStorage so every future read — and the server — agree.
+  // Cookie name + format are a cross-SDK contract: experiment-platform/18-identity-bucketing.md.
+  let id: string | null = readAnonCookie();
+  if (!id && typeof window !== "undefined") {
+    id =
+      (window as { __SE_BOOTSTRAP?: { anonId?: string } }).__SE_BOOTSTRAP?.anonId ?? null;
+  }
+  if (!id) {
+    try {
+      id = localStorage.getItem(ANON_ID_KEY);
+    } catch {}
+  }
+  if (!id) {
+    id =
+      typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : `anon_${Math.random().toString(36).slice(2)}`;
+  }
   try {
     localStorage.setItem(ANON_ID_KEY, id);
   } catch {}
+  writeAnonCookie(id);
   return id;
 }
 

@@ -1,5 +1,33 @@
 # Changelog
 
+## 4.4.0
+
+### Fixed
+
+- **A 100%-rollout gate no longer evaluates `false` for an unidentified request.**
+  `evalGateInternal` previously returned `false` whenever there was no
+  `user_id`/`anonymous_id` — before even checking the rollout — so a fully
+  rolled-out gate read during SSR (where no unit had been minted) came back off.
+  It now short-circuits: with no unit, a gate is on iff `rolloutPct >= 10000`
+  (a fractional rollout still needs a stable unit to bucket, and targeting rules
+  are still evaluated first).
+
+### Added
+
+- **Shared anonymous bucketing id across server and client** so flags and
+  experiments bucket identically on SSR and in the browser at any rollout %, and
+  consistently as a rollout % changes. The stable unit now lives in a
+  first-party, JS-readable `__se_anon_id` cookie (the cross-SDK contract — see
+  `experiment-platform/18-identity-bucketing.md`):
+  - The server `shipeasy()` reads `__se_anon_id` (minted by edge middleware, or
+    by the SDK on cookie-miss), evaluates against it, and threads it into the
+    bootstrap. `getBootstrapHtml` writes the cookie pre-paint and exposes the id
+    on `window.__SE_BOOTSTRAP.anonId`.
+  - The client `getOrCreateAnonId()` is now cookie-first (then bootstrap, then
+    `localStorage`, then mint), mirroring the resolved id into both the cookie
+    and `localStorage` so the browser adopts the exact id SSR bucketed against.
+  - `ANON_ID_COOKIE` is exported from `@shipeasy/sdk/server`.
+
 ## 4.3.0
 
 ### Added
