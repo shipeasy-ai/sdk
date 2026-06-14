@@ -6,12 +6,13 @@ import { Telemetry, DEFAULT_TELEMETRY_URL } from "../telemetry";
 import {
   buildSeeEvent,
   isExpected,
-  markExpected,
   SeeLimiter,
+  startControlFlowChain,
   startSeeChain,
   startSeeViolationChain,
   type Consequence,
   type SeeChain,
+  type SeeControlFlowChain,
   type SeeErrorEvent,
   type SeeExtras,
   type SeeKind,
@@ -22,6 +23,7 @@ import {
 export type {
   Consequence,
   SeeChain,
+  SeeControlFlowChain,
   SeeErrorEvent,
   SeeExtras,
   SeeKind,
@@ -1279,20 +1281,26 @@ export interface SeeApi {
   /**
    * Report a non-exception problem. Prefer passing a caught Error to `see()`
    * when one exists. The name is a stable identifier (it participates in the
-   * issue fingerprint) — variable data goes in `.message()` or `.extras()`.
+   * issue fingerprint) — variable data goes in `.extras()`, never the name.
    *
    * ```ts
    * if (results.length > LIMIT) {
-   *   see.Violation("large query").causes_the("search results").to("be trimmed");
+   *   see.Violation("large query")
+   *      .causes_the("search results").to("be trimmed").extras({ rows: results.length });
    * }
    * ```
    */
   Violation(name: string): SeeViolationChain;
   /**
    * Mark an exception as expected control flow — documents the expectation and
-   * reports nothing. The reason must start with "because".
+   * reports nothing. Say why with `.because()` (reason should start with
+   * "because"); attach optional debug context with `.extras()`.
+   *
+   * ```ts
+   * see.ControlFlowException(e).because("because the metric may not exist yet");
+   * ```
    */
-  ControlFlowException(err: unknown, because: string): void;
+  ControlFlowException(err: unknown): SeeControlFlowChain;
 }
 
 function dispatchSee(
@@ -1317,6 +1325,6 @@ export const see: SeeApi = Object.assign(
   (problem: unknown): SeeChain => startSeeChain(() => problem, dispatchSee),
   {
     Violation: (name: string): SeeViolationChain => startSeeViolationChain(name, dispatchSee),
-    ControlFlowException: markExpected,
+    ControlFlowException: (err: unknown): SeeControlFlowChain => startControlFlowChain(err),
   },
 );

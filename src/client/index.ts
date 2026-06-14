@@ -5,13 +5,14 @@ import {
   buildSeeEvent,
   causesThe,
   isExpected,
-  markExpected,
   SeeLimiter,
+  startControlFlowChain,
   startSeeChain,
   startSeeViolationChain,
   violation,
   type Consequence,
   type SeeChain,
+  type SeeControlFlowChain,
   type SeeErrorEvent,
   type SeeExtras,
   type SeeKind,
@@ -22,6 +23,7 @@ import {
 export type {
   Consequence,
   SeeChain,
+  SeeControlFlowChain,
   SeeErrorEvent,
   SeeExtras,
   SeeKind,
@@ -392,38 +394,16 @@ function installAutoGuardrails(
 
   // ---- Errors: report into the errors primitive via the see() path. ----
   // Caps + 30s dedup live in the client's SeeLimiter; expected control-flow
-  // exceptions (see.expected(err, "because …")) are skipped.
+  // exceptions (see.ControlFlowException(err).because("because …")) are skipped.
+  //
+  // Auto-capture only reports problems with a SPECIFIC subject and a SPECIFIC
+  // outcome — here, a named endpoint failing with a server error / no response.
+  // It deliberately does NOT blanket-report uncaught errors or unhandled
+  // promise rejections: those carry no actionable consequence ("the page hit an
+  // error" names the plumbing, not the feature), so they would mint one
+  // unactionable, double-counted issue for every unrelated failure. Code that
+  // knows the consequence reports it explicitly with see() at the catch site.
   if (groups.errors) {
-    const origOnError = window.onerror;
-    window.onerror = (msg, source, lineno, _colno, err) => {
-      if (!isExpected(err)) {
-        const problem =
-          err ?? (typeof msg === "string" && msg ? msg : "Unknown error");
-        reportSee(
-          problem,
-          causesThe("page").to("hit an unhandled error"),
-          {
-            source: typeof source === "string" ? source : undefined,
-            line: lineno ?? undefined,
-          },
-          "uncaught",
-        );
-      }
-      if (typeof origOnError === "function") return origOnError(msg, source, lineno, _colno, err);
-      return false;
-    };
-
-    window.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
-      const reason = (e as PromiseRejectionEvent).reason;
-      if (isExpected(reason)) return;
-      reportSee(
-        reason ?? "Unhandled promise rejection",
-        causesThe("page").to("hit an unhandled promise rejection"),
-        undefined,
-        "unhandled_rejection",
-      );
-    });
-
     const origFetch = window.fetch;
     window.fetch = async function (...args) {
       const startedAt = typeof performance !== "undefined" ? performance.now() : 0;
@@ -431,9 +411,6 @@ function installAutoGuardrails(
       // Never report the SDK's own collector/telemetry requests — a failing
       // collector would otherwise feed errors back into itself.
       const ignored = ignoreUrlPrefixes.some((p) => p && url.startsWith(p));
-      // Querystring-free URL for the message (it feeds the issue fingerprint);
-      // the full URL still travels in extras for debugging.
-      const bareUrl = url.split("?")[0].slice(0, 200);
       // Per-request correlation token, SAME-ORIGIN ONLY. Sent up on the request
       // header so a server boundary that reports the matching uncaught error
       // can echo it; the backend joins the two issues by it. Cross-origin is
@@ -455,7 +432,7 @@ function installAutoGuardrails(
           // names what's broken ("request to /api/orders/:id") instead of the
           // unactionable "a network request".
           reportSee(
-            violation("NetworkError").message(`request to ${bareUrl} failed`),
+            violation("NetworkError"),
             causesThe(`request to ${endpointTemplate(url)}`).to("get no response"),
             { status: 0, url: url.slice(0, 200) },
             "network",
@@ -465,10 +442,12 @@ function installAutoGuardrails(
       }
       if (!ignored && res.status >= 500) {
         const elapsed = typeof performance !== "undefined" ? performance.now() - startedAt : 0;
-        // Status code stays OUT of the outcome (it's in message + extras):
-        // interpolating it minted a separate issue per status (500/502/503…).
+        // Status code stays OUT of the outcome (it rides in extras): interpolating
+        // it minted a separate issue per status (500/502/503…). The endpoint
+        // template in the subject keeps per-endpoint grouping; the full URL is
+        // in extras for debugging.
         reportSee(
-          violation("Http5xx").message(`request to ${bareUrl} returned ${res.status}`),
+          violation("Http5xx"),
           causesThe(`request to ${endpointTemplate(url)}`).to("fail with a server error"),
           { status: res.status, url: url.slice(0, 200), duration_ms: Math.round(elapsed) },
           "network",
@@ -1643,28 +1622,29 @@ export interface SeeApi {
   /**
    * Report a non-exception problem. Prefer passing a caught Error to `see()`
    * when one exists. The name is a stable identifier (it participates in the
-   * issue fingerprint) — variable data goes in `.message()` or `.extras()`.
+   * issue fingerprint) — variable data goes in `.extras()`, never the name.
    *
    * ```ts
    * if (rows.length > LIMIT) {
-   *   see.Violation("large query").message(`got ${rows.length} rows`)
-   *      .causes_the("search results").to("be trimmed");
+   *   see.Violation("large query")
+   *      .causes_the("search results").to("be trimmed").extras({ rows: rows.length });
    * }
    * ```
    */
   Violation(name: string): SeeViolationChain;
   /**
    * Mark an exception as expected control flow — auto-capture skips it and
-   * nothing is reported. The reason must start with "because".
+   * nothing is reported. Say why with `.because()` (reason should start with
+   * "because"); attach optional debug context with `.extras()`.
    *
    * ```ts
    * } catch (e) {
-   *   see.ControlFlowException(e, "because the blob wasn't an encoded Foo");
+   *   see.ControlFlowException(e).because("because the blob wasn't an encoded Foo");
    *   return decodeAsBar(blob);
    * }
    * ```
    */
-  ControlFlowException(err: unknown, because: string): void;
+  ControlFlowException(err: unknown): SeeControlFlowChain;
 }
 
 function dispatchSee(
@@ -1689,7 +1669,7 @@ export const see: SeeApi = Object.assign(
   (problem: unknown): SeeChain => startSeeChain(() => problem, dispatchSee),
   {
     Violation: (name: string): SeeViolationChain => startSeeViolationChain(name, dispatchSee),
-    ControlFlowException: markExpected,
+    ControlFlowException: (err: unknown): SeeControlFlowChain => startControlFlowChain(err),
   },
 );
 

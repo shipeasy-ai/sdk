@@ -1,5 +1,42 @@
 # Changelog
 
+## 5.0.0
+
+### Changed (BREAKING)
+
+- **`see.ControlFlowException` is now a fluent chain.** The reason moves out of a
+  positional argument and onto a `.because()` step, with an optional `.extras()`
+  tail for local debug context:
+
+  ```ts
+  // before
+  see.ControlFlowException(e, "because it wasn't an encoded Foo");
+  // after
+  see.ControlFlowException(e).because("because it wasn't an encoded Foo");
+  // optional debug context (kept on the mark for local debugging; never sent,
+  // since an expected exception is by definition not reported):
+  see.ControlFlowException(e).because("because it wasn't a Foo").extras({ tried: "Foo" });
+  ```
+
+- **`see.Violation` no longer has a `.message()`.** A violation's identity is its
+  name; all variable/context data goes in `.extras()`. Migrate
+  `see.Violation(n).message(m)...` to `see.Violation(n)....extras({ … })`. On the
+  wire a violation's `message` is now its name (it already participated in the
+  fingerprint via the name + consequence).
+
+- **Auto-capture is limited to specific network failures.** The client no longer
+  blanket-reports uncaught exceptions or unhandled promise rejections — those
+  produced generic, consequence-less issues ("the page hit an error") that name
+  the plumbing, not the feature, and double-counted anything an explicit `see()`
+  already reported. Auto-capture now reports only `fetch` network errors and
+  5xx, each carrying a specific endpoint subject and outcome. Report everything
+  else explicitly with `see()` where the consequence is known.
+
+- **`see()` + re-throw is now blessed, not banned.** Reporting a caught error and
+  then re-throwing it links the re-thrown occurrence to the inner report as a
+  `caused_by` chain (no double-count). The old "never `see()` then `throw`" rule
+  is removed.
+
 ## 4.5.0
 
 ### Added

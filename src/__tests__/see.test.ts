@@ -12,6 +12,7 @@ import {
   SEE_MAX_EXTRA_KEYS,
   SEE_MAX_MESSAGE,
   SEE_MAX_STACK,
+  startControlFlowChain,
   startSeeChain,
   startSeeViolationChain,
   violation,
@@ -41,16 +42,11 @@ describe("causesThe builder", () => {
 });
 
 describe("violation builder", () => {
-  it("builds a branded violation; message() returns a new violation", () => {
+  it("builds a branded violation from the name (no message — context goes in extras)", () => {
     const v = violation("large query");
     expect(v.__seViolation).toBe(true);
     expect(v.violationName).toBe("large query");
-    expect(v.violationMessage).toBeUndefined();
-    const w = v.message("got 5000 rows");
-    expect(w.violationName).toBe("large query");
-    expect(w.violationMessage).toBe("got 5000 rows");
-    // original unchanged (builder is immutable)
-    expect(v.violationMessage).toBeUndefined();
+    expect((v as unknown as Record<string, unknown>).violationMessage).toBeUndefined();
   });
 });
 
@@ -101,21 +97,16 @@ describe("buildSeeEvent", () => {
     expect(typeof ev.ts).toBe("number");
   });
 
-  it("maps a violation to kind=violation; name becomes error_type", () => {
+  it("maps a violation to kind=violation; name becomes both error_type and message", () => {
     const ev = buildSeeEvent(
-      violation("large query").message("got 5000 rows"),
+      violation("large query"),
       causesThe("results").to("be trimmed"),
       undefined,
       CTX,
     );
     expect(ev.kind).toBe("violation");
     expect(ev.error_type).toBe("large query");
-    expect(ev.message).toBe("got 5000 rows");
-  });
-
-  it("violation without message falls back to the name", () => {
-    const ev = buildSeeEvent(violation("oops"), causesThe("a").to("b"), undefined, CTX);
-    expect(ev.message).toBe("oops");
+    expect(ev.message).toBe("large query");
   });
 
   it("handles thrown non-Errors (string)", () => {
@@ -298,19 +289,19 @@ describe("see chain (startSeeChain / startSeeViolationChain)", () => {
     expect(calls[0].consequence.outcome).toBe("hit an error");
   });
 
-  it("violation chain builds the violation lazily with message()", async () => {
+  it("violation chain builds the violation lazily; context rides in extras", async () => {
     const { calls, dispatch } = collect();
     startSeeViolationChain("large query", dispatch)
-      .message("got 5000 rows")
       .causes_the("results")
-      .to("be trimmed");
+      .to("be trimmed")
+      .extras({ rows: 5000 });
     await tick();
     expect(calls).toHaveLength(1);
     const v = calls[0].problem;
     expect(isViolation(v)).toBe(true);
     expect((v as { violationName: string }).violationName).toBe("large query");
-    expect((v as { violationMessage?: string }).violationMessage).toBe("got 5000 rows");
     expect(calls[0].consequence.subject).toBe("results");
+    expect(calls[0].extras).toEqual({ rows: 5000 });
   });
 });
 
@@ -324,10 +315,37 @@ describe("markExpected / isExpected", () => {
     expect(JSON.stringify(err)).toBe("{}");
   });
 
+  it("carries optional extras on the mark without enumerable side effects", () => {
+    const err = new Error("x");
+    markExpected(err, "because it wasn't a Foo", { tried: "Foo", bytes: 12 });
+    expect(isExpected(err)).toBe(true);
+    expect(Object.keys(err)).toEqual([]);
+    expect(JSON.stringify(err)).toBe("{}");
+  });
+
   it("tolerates non-object reasons", () => {
     expect(() => markExpected("a string", "because")).not.toThrow();
     expect(isExpected("a string")).toBe(false);
     expect(isExpected(null)).toBe(false);
+  });
+});
+
+describe("startControlFlowChain", () => {
+  it("because() marks the error expected; the chain stays non-enumerable", () => {
+    const err = new Error("not really a problem");
+    expect(isExpected(err)).toBe(false);
+    startControlFlowChain(err).because("because it wasn't an encoded Foo");
+    expect(isExpected(err)).toBe(true);
+    expect(Object.keys(err)).toEqual([]);
+    expect(JSON.stringify(err)).toBe("{}");
+  });
+
+  it("supports the optional .extras() tail and reports nothing", () => {
+    const err = new Error("x");
+    expect(() =>
+      startControlFlowChain(err).because("because the blob wasn't a Foo").extras({ tried: "Foo" }),
+    ).not.toThrow();
+    expect(isExpected(err)).toBe(true);
   });
 });
 
@@ -443,20 +461,21 @@ describe("client see() wiring", () => {
     expect(ev.side).toBe("client");
   });
 
-  it("see.Violation() chain reports kind=violation", async () => {
+  it("see.Violation() chain reports kind=violation; context rides in extras", async () => {
     const { mod, sendBeacon } = await bootClient();
     mod.see
       .Violation("large query")
-      .message("got 5000 rows")
       .causes_the("results")
-      .to("be trimmed");
+      .to("be trimmed")
+      .extras({ rows: 5000 });
     await tick();
     expect(sendBeacon).toHaveBeenCalledTimes(1);
     const body = JSON.parse(await (sendBeacon.mock.calls[0][1] as Blob).text());
     const ev = body.events[0];
     expect(ev.kind).toBe("violation");
     expect(ev.error_type).toBe("large query");
-    expect(ev.message).toBe("got 5000 rows");
+    expect(ev.message).toBe("large query");
+    expect(ev.extras).toMatchObject({ rows: 5000 });
   });
 
   it("see() before configure warns and drops", async () => {
@@ -478,28 +497,17 @@ describe("client see() wiring", () => {
     expect(sendBeacon).toHaveBeenCalledTimes(1);
   });
 
-  it("auto-capture: window.onerror reports kind=uncaught and skips control-flow errors", async () => {
-    const { mod, client, sendBeacon } = await bootClient();
+  it("auto-capture: leaves window.onerror untouched — no generic page-level capture", async () => {
+    const { client, sendBeacon } = await bootClient();
     await client.identify({});
-    const w = globalThis.window as unknown as {
-      onerror: (m: unknown, s?: string, l?: number, c?: number, e?: Error) => boolean;
-    };
-    expect(typeof w.onerror).toBe("function");
-
-    const expected = new Error("expected control flow");
-    mod.see.ControlFlowException(expected, "because tests say so");
-    w.onerror("msg", "app.js", 1, 1, expected);
+    const w = globalThis.window as unknown as { onerror: unknown };
+    // The SDK no longer overrides window.onerror or wires an unhandledrejection
+    // listener: those produced generic, consequence-less reports ("the page hit
+    // an error"). Auto-capture is now limited to specific network failures and
+    // explicit see() calls. window.onerror stays exactly as the host left it.
+    expect(typeof w.onerror).not.toBe("function");
+    await tick();
     expect(sendBeacon).not.toHaveBeenCalled();
-
-    w.onerror("Uncaught TypeError: nope", "app.js", 42, 1, new TypeError("nope"));
-    expect(sendBeacon).toHaveBeenCalledTimes(1);
-    const body = JSON.parse(await (sendBeacon.mock.calls[0][1] as Blob).text());
-    const ev = body.events[0];
-    expect(ev.type).toBe("error");
-    expect(ev.kind).toBe("uncaught");
-    expect(ev.error_type).toBe("TypeError");
-    expect(ev.subject).toBe("page");
-    expect(ev.extras).toMatchObject({ source: "app.js", line: 42 });
   });
 
   it("auto-capture: fetch 5xx reports kind=network but skips the collector itself", async () => {
@@ -516,13 +524,14 @@ describe("client see() wiring", () => {
     const ev = body.events[0];
     expect(ev.kind).toBe("network");
     expect(ev.error_type).toBe("Http5xx");
-    expect(ev.message).toContain("https://api.test/orders"); // querystring stripped
-    expect(ev.message).not.toContain("id=123");
+    // The violation name is the message now — the URL rides in extras only.
+    expect(ev.message).toBe("Http5xx");
     // Consequence names the endpoint (cross-origin → host kept, query dropped)
     // and never embeds the status code — it would mint one issue per status.
     expect(ev.subject).toBe("request to api.test/orders");
     expect(ev.outcome).toBe("fail with a server error");
     expect(ev.extras).toMatchObject({ status: 503 });
+    expect(ev.extras.url).toContain("https://api.test/orders");
 
     // 5xx from the SDK's own collector → ignored
     sendBeacon.mockClear();

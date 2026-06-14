@@ -35,15 +35,13 @@ export interface Consequence {
 
 /**
  * Non-exception problem, built by `violation(name)`. A plain branded object
- * (not an Error subclass) so `.message()` can be a builder method without
- * colliding with `Error.prototype.message`.
+ * (not an Error subclass). The name is the whole identity — there is no
+ * separate message; any variable/context data belongs in `.extras()` on the
+ * see chain, never on the violation itself.
  */
 export interface Violation {
   readonly __seViolation: true;
   readonly violationName: string;
-  readonly violationMessage?: string;
-  /** Attach free-form detail. Variable data goes HERE (or in extras), never in the name. */
-  message(msg: string): Violation;
 }
 
 /**
@@ -121,18 +119,10 @@ export function causesThe(subject: string): { to(outcome: string): Consequence }
 /**
  * A non-exception problem. Prefer passing a caught Error when one exists.
  * The name is a stable identifier (it participates in the issue fingerprint) —
- * put variable data in `.message()` or extras, never in the name.
+ * put variable data in `.extras()`, never in the name.
  */
 export function violation(name: string): Violation {
-  const make = (msg?: string): Violation => ({
-    __seViolation: true,
-    violationName: String(name),
-    ...(msg !== undefined ? { violationMessage: msg } : {}),
-    message(m: string): Violation {
-      return make(String(m));
-    },
-  });
-  return make();
+  return { __seViolation: true, violationName: String(name) };
 }
 
 export function isViolation(p: unknown): p is Violation {
@@ -147,15 +137,39 @@ export function isConsequence(c: unknown): c is Consequence {
 
 const EXPECTED_SYM = Symbol.for("@shipeasy/sdk:see-expected");
 
+/** What gets stashed on an expected error: the reason plus optional debug extras. */
+export interface ExpectedMark {
+  because: string;
+  extras?: Record<string, string | number | boolean>;
+}
+
+function readExpectedMark(err: unknown): ExpectedMark | undefined {
+  if (typeof err !== "object" || err === null) return undefined;
+  const v = (err as Record<symbol, unknown>)[EXPECTED_SYM];
+  return v !== undefined && v !== null && typeof v === "object"
+    ? (v as ExpectedMark)
+    : undefined;
+}
+
 /**
  * Mark an exception as expected control flow — auto-capture skips it and
- * nothing is reported. The reason should start with "because".
+ * nothing is reported. The reason should start with "because". Optional extras
+ * ride along on the mark for local debugging only — an expected exception is by
+ * definition not reported, so they are never transmitted. Re-marking the same
+ * error merges extras (later wins) and keeps the latest reason.
  */
-export function markExpected(err: unknown, because: string): void {
+export function markExpected(err: unknown, because: string, extras?: SeeExtras): void {
   if (typeof err !== "object" || err === null) return;
+  const prev = readExpectedMark(err);
+  const clean = sanitizeExtras(extras);
+  const merged = prev?.extras || clean ? { ...prev?.extras, ...clean } : undefined;
+  const mark: ExpectedMark = {
+    because: String(because),
+    ...(merged ? { extras: merged } : {}),
+  };
   try {
     Object.defineProperty(err, EXPECTED_SYM, {
-      value: String(because),
+      value: mark,
       enumerable: false,
       configurable: true,
     });
@@ -301,7 +315,7 @@ export function buildSeeEvent(
 
   if (isViolation(problem)) {
     errorType = problem.violationName;
-    message = problem.violationMessage ?? problem.violationName;
+    message = problem.violationName;
     stack = captureCallsiteStack();
     kind = kindOverride ?? "violation";
   } else if (problem instanceof Error) {
@@ -359,9 +373,9 @@ function safeString(v: unknown): string {
 // The public API is a single `see` import with a chained grammar:
 //
 //   see(err).causes_the("checkout").to("use cached prices").extras({ order_id });
-//   see.violation("large query").message("got 5000 rows")
-//      .causes_the("results").to("be trimmed");
-//   see.expected(err, "because it wasn't an encoded Foo");
+//   see.Violation("large query")
+//      .causes_the("results").to("be trimmed").extras({ rows });
+//   see.ControlFlowException(err).because("because it wasn't an encoded Foo");
 //
 // The chain collects subject/outcome/extras synchronously and dispatches on
 // the next microtask — so the report ships immediately after the statement,
@@ -400,9 +414,24 @@ export interface SeeChain {
   causesThe(subject: string): SeeOutcomeStep;
 }
 
-export interface SeeViolationChain extends SeeChain {
-  /** Free-form detail. Variable data goes here (or extras), never in the name. */
-  message(msg: string): SeeViolationChain;
+/**
+ * Violations share the exception consequence grammar exactly — there is no
+ * separate `.message()`. Put any variable/context data in `.extras()`.
+ */
+export type SeeViolationChain = SeeChain;
+
+export interface SeeControlFlowTail {
+  /**
+   * Optional debugging context for the expected exception. Kept on the mark for
+   * local debugging only (expected exceptions are never reported). Callable
+   * repeatedly — keys merge, later wins.
+   */
+  extras(extras: SeeExtras): SeeControlFlowTail;
+}
+
+export interface SeeControlFlowChain {
+  /** Document why the exception is expected. The reason should start with "because". */
+  because(reason: string): SeeControlFlowTail;
 }
 
 export function startSeeChain(getProblem: () => unknown, dispatch: SeeDispatch): SeeChain {
@@ -443,19 +472,28 @@ export function startSeeChain(getProblem: () => unknown, dispatch: SeeDispatch):
 }
 
 export function startSeeViolationChain(name: string, dispatch: SeeDispatch): SeeViolationChain {
-  let msg: string | undefined;
-  const base = startSeeChain(
-    () => (msg !== undefined ? violation(name).message(msg) : violation(name)),
-    dispatch,
-  );
-  const chain: SeeViolationChain = {
-    ...base,
-    message(m: string): SeeViolationChain {
-      msg = String(m);
-      return chain;
+  return startSeeChain(() => violation(name), dispatch);
+}
+
+/**
+ * Fluent control-flow marker: `see.ControlFlowException(e).because("because …")`.
+ * `.because()` records the reason and marks the error so auto-capture skips it;
+ * the optional `.extras()` tail attaches local debug context. Nothing is
+ * reported — an expected exception is, by definition, not a problem.
+ */
+export function startControlFlowChain(err: unknown): SeeControlFlowChain {
+  return {
+    because(reason: string): SeeControlFlowTail {
+      markExpected(err, reason);
+      const tail: SeeControlFlowTail = {
+        extras(x: SeeExtras): SeeControlFlowTail {
+          markExpected(err, reason, x);
+          return tail;
+        },
+      };
+      return tail;
     },
   };
-  return chain;
 }
 
 // ---- Rate limiting / dedup ----

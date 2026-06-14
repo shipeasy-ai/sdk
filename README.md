@@ -69,12 +69,12 @@ try {
 }
 
 // Non-exception problems — the name is a stable identifier (it participates
-// in the issue fingerprint); variable data goes in .message() / .extras():
+// in the issue fingerprint); all variable data goes in .extras():
 if (rows.length > LIMIT) {
   see.Violation("large query")
-    .message(`got ${rows.length} rows`)
     .causes_the("search results")
-    .to("be trimmed");
+    .to("be trimmed")
+    .extras({ rows: rows.length });
 }
 
 // Expected control-flow exceptions: document them, report nothing —
@@ -82,7 +82,7 @@ if (rows.length > LIMIT) {
 try {
   return decodeFoo(blob);
 } catch (e) {
-  see.ControlFlowException(e, "because it wasn't an encoded Foo");
+  see.ControlFlowException(e).because("because it wasn't an encoded Foo");
   return decodeBar(blob);
 }
 ```
@@ -94,16 +94,19 @@ occurrence timeseries. The chain dispatches on the next microtask — no
 `fetch` on the server), spam-guarded by a 30s dedup window and a per-session
 cap.
 
-The client SDK also auto-captures uncaught exceptions, unhandled rejections,
-and network failures (fetch network errors + 5xx) into the same primitive
-(`autoCollect: { errors }`, on by default). Auto-capture is the outer safety
-net — it does not replace `see()` in catch blocks, where you know the
-consequence and it cannot.
+The client SDK also auto-captures **network failures** (fetch network errors +
+5xx) into the same primitive (`autoCollect: { errors }`, on by default) — each
+names a specific endpoint and a specific outcome. It deliberately does **not**
+blanket-report uncaught exceptions or unhandled promise rejections: those carry
+no actionable consequence ("the page hit an error" names the plumbing, not the
+feature). Code that knows the consequence reports it explicitly with `see()` at
+the catch site.
 
-**Rules**: if you don't know the consequence, don't catch the exception. Never
-`see()` then `throw` (double counting — either handle or rethrow). Never use
-`see.Violation()` for a caught exception (you'd drop the stack). No PII or
-high-cardinality data in extras.
+**Rules**: if you don't know the consequence, don't catch the exception. You
+**may** `see()` then re-throw — the re-thrown error links to its inner report
+as a `caused_by` chain instead of double-counting. Never use `see.Violation()`
+for a caught exception (you'd drop the stack). No PII or high-cardinality data
+in extras.
 
 ## Drop-in `<script>` loader (no bundler)
 
