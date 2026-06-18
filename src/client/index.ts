@@ -647,6 +647,13 @@ export interface FlagsClientBrowserOptions {
   disableTelemetry?: boolean;
   /** Override the telemetry beacon host. Defaults to {@link DEFAULT_TELEMETRY_URL}. */
   telemetryUrl?: string;
+  /**
+   * Test mode — no network at all. identify()/init are no-ops (never call
+   * /sdk/evaluate), track() is a no-op, telemetry is forced off, and the client
+   * starts "ready" with an empty eval result. Prefer the
+   * {@link FlagsClientBrowser.forTesting} factory over passing this directly.
+   */
+  testMode?: boolean;
 }
 
 /**
@@ -823,6 +830,19 @@ export class FlagsClientBrowser {
   // Monotonic counter so a later identify() always wins even if its /sdk/evaluate
   // response races and lands before an earlier in-flight call's response.
   private identifySeq = 0;
+  // Test mode: built by `FlagsClientBrowser.forTesting()`. When set, identify()
+  // never fetches, track() is a no-op, telemetry is off, and the client is
+  // already ready with an empty eval result.
+  private readonly testMode: boolean;
+  // Programmatic overrides (Statsig-style). Set on any client via
+  // overrideFlag/overrideConfig/overrideExperiment; they win over BOTH the URL
+  // overrides and the fetched eval result. Cleared by clearOverrides().
+  private readonly flagOverrides = new Map<string, boolean>();
+  private readonly configOverrides = new Map<string, unknown>();
+  private readonly experimentOverrides = new Map<
+    string,
+    { group: string; params: Record<string, unknown> }
+  >();
   private onOverrideChange = () => {
     this.installBridge();
     this.notify();
@@ -832,6 +852,7 @@ export class FlagsClientBrowser {
     this.sdkKey = opts.sdkKey;
     this.baseUrl = (opts.baseUrl ?? "https://edge.shipeasy.dev").replace(/\/$/, "");
     this.env = opts.env ?? "prod";
+    this.testMode = opts.testMode === true;
     // Auto web vitals + error capture defaults ON. Vitals/engagement emit
     // `__auto_*` metric events (the worker bypasses event-catalog validation
     // for those names); errors report into the errors primitive via the see()
@@ -852,12 +873,48 @@ export class FlagsClientBrowser {
       sdkKey: this.sdkKey,
       side: "client",
       env: this.env,
-      disabled: opts.disableTelemetry,
+      // Test mode never talks to the network — telemetry off regardless of opt.
+      disabled: this.testMode || opts.disableTelemetry,
     });
-    void this.buffer.flushPendingAlias();
+    if (this.testMode) {
+      // Start "ready" with an empty eval result so getters read from overrides
+      // without any /sdk/evaluate having happened.
+      this.evalResult = { flags: {}, configs: {}, experiments: {}, killswitches: {} };
+    } else {
+      void this.buffer.flushPendingAlias();
+    }
+  }
+
+  /**
+   * Build a no-network, immediately-usable browser client for tests
+   * (Statsig-style). identify() is a no-op (never calls /sdk/evaluate), track()
+   * is a no-op, telemetry is disabled, and the client is already ready — seed
+   * every entity with overrideFlag/overrideConfig/overrideExperiment. No SDK
+   * key required.
+   *
+   * ```ts
+   * const client = FlagsClientBrowser.forTesting();
+   * client.overrideFlag("new_checkout", true);
+   * client.getFlag("new_checkout"); // true
+   * ```
+   */
+  static forTesting(opts?: Partial<FlagsClientBrowserOptions>): FlagsClientBrowser {
+    return new FlagsClientBrowser({
+      sdkKey: "",
+      autoGuardrails: false,
+      ...opts,
+      testMode: true,
+    });
   }
 
   async identify(user: User): Promise<void> {
+    if (this.testMode) {
+      // No-op — capture user_id for track()/exposure attribution, but never
+      // hit /sdk/evaluate. Notify so subscribers settle.
+      if (user.user_id !== undefined) this.userId = user.user_id;
+      this.notify();
+      return;
+    }
     const seq = ++this.identifySeq;
     const prevUserId = this.userId;
     // Override caller-supplied user fields onto whatever was set by previous
@@ -964,8 +1021,42 @@ export class FlagsClientBrowser {
     this.evalResult = data;
   }
 
+  // ---- Local overrides (Statsig-style) ----
+  //
+  // Precedence (highest first): programmatic override (these methods) > URL
+  // override (?se_gate_/?se_config_/?se_exp_) > fetched eval result. A
+  // programmatic override is an explicit in-code decision, so it wins over the
+  // ad-hoc URL/devtools overrides as well as the server's evaluation.
+
+  /** Force `getFlag(name)` to return `value`, ignoring URL overrides + eval. */
+  overrideFlag(name: string, value: boolean): void {
+    this.flagOverrides.set(name, value);
+  }
+
+  /** Force `getConfig(name)` to return `value`, ignoring URL overrides + eval. */
+  overrideConfig(name: string, value: unknown): void {
+    this.configOverrides.set(name, value);
+  }
+
+  /**
+   * Force `getExperiment(name, …)` to return `{ inExperiment: true, group, params }`,
+   * ignoring URL overrides, the eval result, and exposure logging.
+   */
+  overrideExperiment(name: string, group: string, params: Record<string, unknown>): void {
+    this.experimentOverrides.set(name, { group, params });
+  }
+
+  /** Remove every programmatic override set via the override* methods. */
+  clearOverrides(): void {
+    this.flagOverrides.clear();
+    this.configOverrides.clear();
+    this.experimentOverrides.clear();
+  }
+
   getFlag(name: string): boolean {
     this.telemetry.emit("gate", name);
+    const pov = this.flagOverrides.get(name);
+    if (pov !== undefined) return pov;
     if (this.evalResult === null) return false;
     const ov = readGateOverride(name);
     if (ov !== null) return ov;
@@ -974,9 +1065,14 @@ export class FlagsClientBrowser {
 
   getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined {
     this.telemetry.emit("config", name);
-    if (this.evalResult === null) return undefined;
-    const ov = readConfigOverride(name);
-    const raw = ov !== undefined ? ov : this.evalResult.configs?.[name];
+    const hasProgrammatic = this.configOverrides.has(name);
+    if (!hasProgrammatic && this.evalResult === null) return undefined;
+    const urlOv = hasProgrammatic ? undefined : readConfigOverride(name);
+    const raw = hasProgrammatic
+      ? this.configOverrides.get(name)
+      : urlOv !== undefined
+        ? urlOv
+        : this.evalResult?.configs?.[name];
     if (raw === undefined) return undefined;
     if (!decode) return raw as T;
     try {
@@ -999,6 +1095,16 @@ export class FlagsClientBrowser {
       group: "control",
       params: defaultParams,
     };
+
+    // Programmatic override wins over URL overrides + the eval result, and
+    // skips exposure logging (it's an explicit in-code decision, not a real
+    // enrolment). Caller `variants` still merge on top of defaults.
+    const pov = this.experimentOverrides.get(name);
+    if (pov) {
+      const variantParams = variants?.[pov.group];
+      const params = { ...defaultParams, ...pov.params, ...(variantParams ?? {}) };
+      return { inExperiment: true, group: pov.group, params };
+    }
 
     // URL-forced variant short-circuits the server response so the demo
     // works synchronously before identify() resolves. Caller can supply a
@@ -1059,6 +1165,7 @@ export class FlagsClientBrowser {
   }
 
   track(eventName: string, props?: Record<string, unknown>): void {
+    if (this.testMode) return; // no-op in test mode — never touch the network
     this.buffer.pushMetric(eventName, this.userId, this.anonId, props);
   }
 

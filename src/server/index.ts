@@ -328,6 +328,13 @@ export interface FlagsClientOptions {
   disableTelemetry?: boolean;
   /** Override the telemetry beacon host. Defaults to {@link DEFAULT_TELEMETRY_URL}. */
   telemetryUrl?: string;
+  /**
+   * Test mode — no network at all. init()/initOnce() are no-ops (never fetch),
+   * track() is a no-op, telemetry is forced off, and the client starts
+   * "initialized" with an empty blob. Prefer the {@link FlagsClient.forTesting}
+   * factory over passing this directly.
+   */
+  testMode?: boolean;
 }
 
 export class FlagsClient {
@@ -343,34 +350,100 @@ export class FlagsClient {
   private pollInterval = 30;
   private timer: ReturnType<typeof setInterval> | null = null;
   private initialized = false;
+  // Test mode: built by `FlagsClient.forTesting()`. When set, init()/initOnce()
+  // never fetch, track() is a no-op, and telemetry is off — the client is a
+  // fully self-contained, network-free seam for unit tests.
+  private readonly testMode: boolean;
+  // Programmatic overrides (Statsig-style). Set on any client via
+  // overrideFlag/overrideConfig/overrideExperiment; they win over the fetched
+  // blob in getFlag/getConfig/getExperiment. Cleared by clearOverrides().
+  private readonly flagOverrides = new Map<string, boolean>();
+  private readonly configOverrides = new Map<string, unknown>();
+  private readonly experimentOverrides = new Map<
+    string,
+    { group: string; params: Record<string, unknown> }
+  >();
 
   constructor(opts: FlagsClientOptions) {
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? "https://cdn.shipeasy.ai").replace(/\/$/, "");
     this.env = opts.env ?? "prod";
+    this.testMode = opts.testMode === true;
     this.telemetry = new Telemetry({
       endpoint: opts.telemetryUrl ?? DEFAULT_TELEMETRY_URL,
       sdkKey: this.apiKey,
       side: "server",
       env: this.env,
-      disabled: opts.disableTelemetry,
+      // Test mode never talks to the network — telemetry off regardless of opt.
+      disabled: this.testMode || opts.disableTelemetry,
     });
-    if (opts.initialBlob) {
-      this.flagsBlob = opts.initialBlob;
+    if (opts.initialBlob || this.testMode) {
+      // Seed an empty blob in test mode so getters read from overrides without
+      // any fetch having happened.
+      this.flagsBlob =
+        opts.initialBlob ?? { version: "test", plan: "free", gates: {}, configs: {}, killswitches: {} };
+      this.expsBlob = this.expsBlob ?? { version: "test", universes: {}, experiments: {} };
       this.initialized = true;
     }
   }
 
+  /**
+   * Build a no-network, immediately-usable client for tests (Statsig-style).
+   * init()/initOnce() are no-ops (never fetch), track() is a no-op, telemetry
+   * is disabled, and the client is already "initialized" — seed every entity
+   * with overrideFlag/overrideConfig/overrideExperiment. No SDK key required.
+   *
+   * ```ts
+   * const client = FlagsClient.forTesting();
+   * client.overrideFlag("new_checkout", true);
+   * client.getFlag("new_checkout", { user_id: "u1" }); // true
+   * ```
+   */
+  static forTesting(opts?: Partial<FlagsClientOptions>): FlagsClient {
+    return new FlagsClient({ apiKey: "", ...opts, testMode: true });
+  }
+
   async init(): Promise<void> {
+    if (this.testMode) {
+      this.initialized = true;
+      return;
+    }
     await this.fetchAll();
     this.initialized = true;
     this.startPoll();
   }
 
   async initOnce(): Promise<void> {
-    if (this.initialized) return;
+    if (this.testMode || this.initialized) return;
     await this.fetchAll();
     this.initialized = true;
+  }
+
+  // ---- Local overrides (Statsig-style) ----
+
+  /** Force `getFlag(name, …)` to return `value`, ignoring the fetched gate. */
+  overrideFlag(name: string, value: boolean): void {
+    this.flagOverrides.set(name, value);
+  }
+
+  /** Force `getConfig(name)` to return `value`, ignoring the fetched config. */
+  overrideConfig(name: string, value: unknown): void {
+    this.configOverrides.set(name, value);
+  }
+
+  /**
+   * Force `getExperiment(name, …)` to return `{ inExperiment: true, group, params }`,
+   * ignoring allocation, holdouts, and targeting.
+   */
+  overrideExperiment(name: string, group: string, params: Record<string, unknown>): void {
+    this.experimentOverrides.set(name, { group, params });
+  }
+
+  /** Remove every programmatic override set via the override* methods. */
+  clearOverrides(): void {
+    this.flagOverrides.clear();
+    this.configOverrides.clear();
+    this.experimentOverrides.clear();
   }
 
   destroy(): void {
@@ -425,6 +498,8 @@ export class FlagsClient {
 
   getFlag(name: string, user: User): boolean {
     this.telemetry.emit("gate", name);
+    const ov = this.flagOverrides.get(name);
+    if (ov !== undefined) return ov;
     const gate = this.flagsBlob?.gates[name];
     if (!gate) return false;
     return evalGateInternal(gate, user);
@@ -432,10 +507,12 @@ export class FlagsClient {
 
   getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined {
     this.telemetry.emit("config", name);
-    const entry = this.flagsBlob?.configs[name];
-    if (!entry) return undefined;
-    if (!decode) return entry.value as T;
-    return decode(entry.value);
+    const raw = this.configOverrides.has(name)
+      ? this.configOverrides.get(name)
+      : this.flagsBlob?.configs[name]?.value;
+    if (raw === undefined && !this.configOverrides.has(name)) return undefined;
+    if (!decode) return raw as T;
+    return decode(raw);
   }
 
   getExperiment<P extends Record<string, unknown>>(
@@ -450,6 +527,16 @@ export class FlagsClient {
       group: "control",
       params: defaultParams,
     };
+    const ov = this.experimentOverrides.get(name);
+    if (ov) {
+      if (!decode) return { inExperiment: true, group: ov.group, params: ov.params as P };
+      try {
+        return { inExperiment: true, group: ov.group, params: decode(ov.params) };
+      } catch (err) {
+        console.warn(`[shipeasy] getExperiment('${name}') override decode failed:`, String(err));
+        return notIn;
+      }
+    }
     if (!this.flagsBlob || !this.expsBlob) return notIn;
 
     const exp = this.expsBlob.experiments[name];
@@ -496,6 +583,7 @@ export class FlagsClient {
   }
 
   track(userId: string, eventName: string, props?: Record<string, unknown>): void {
+    if (this.testMode) return; // no-op in test mode — never touch the network
     const body = JSON.stringify({
       events: [
         {

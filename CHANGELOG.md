@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Local-override test utility (Statsig-style).** Both `FlagsClient` (server)
+  and `FlagsClientBrowser` (browser) gain a `forTesting()` static factory that
+  returns a no-network, immediately-usable client — `init()`/`initOnce()`/
+  `identify()` are no-ops (they never fetch), `track()` is a no-op, telemetry is
+  off, no SDK key is required, and the client starts initialized/ready. Seed
+  every entity with the new override setters (also usable on a normal client):
+
+  ```ts
+  const client = FlagsClient.forTesting();
+  client.overrideFlag("new_checkout", true);
+  client.overrideConfig("upload_limits", { max_uploads: 50 });
+  client.overrideExperiment("hero_cta", "treatment", { primary_label: "Buy now" });
+  client.getFlag("new_checkout", { user_id: "u1" }); // true
+  client.clearOverrides();
+  ```
+
+  An override always wins over the fetched values. In the browser the precedence
+  is: programmatic override > URL/devtools override > the server's evaluation.
+  New methods: `overrideFlag`, `overrideConfig`, `overrideExperiment`,
+  `clearOverrides`.
+
 ## 5.0.0
 
 ### Changed (BREAKING)

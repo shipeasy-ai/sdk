@@ -130,6 +130,66 @@ The loader IIFE is published to a public R2 bucket on every release and
 cached for 1y at `loader-vX.Y.Z.js` (immutable) plus a rolling 5-minute
 `loader.js`.
 
+## Testing
+
+For unit tests, build a **no-network** client with `forTesting()` and seed every
+entity with local overrides (Statsig-style). In test mode the client is already
+"initialized"/"ready", `init()`/`initOnce()`/`identify()` are no-ops (they never
+fetch), `track()` is a no-op, telemetry is disabled, and no SDK key is required —
+so your tests never touch the network.
+
+```ts
+// Server (Node / Cloudflare Worker / Deno)
+import { FlagsClient } from "@shipeasy/sdk/server";
+
+const client = FlagsClient.forTesting();
+
+client.overrideFlag("new_checkout", true);
+client.overrideConfig("upload_limits", { max_uploads: 50 });
+client.overrideExperiment("hero_cta", "treatment", { primary_label: "Buy now" });
+
+client.getFlag("new_checkout", { user_id: "u1" }); // true
+client.getConfig("upload_limits"); // { max_uploads: 50 }
+client.getExperiment("hero_cta", { user_id: "u1" }, { primary_label: "Sign up" });
+// → { inExperiment: true, group: "treatment", params: { primary_label: "Buy now" } }
+
+client.track("u1", "purchase"); // no-op — never hits the network
+client.clearOverrides(); // reset every override back to default
+```
+
+```ts
+// Browser (vanilla JS — no React required)
+import { FlagsClientBrowser } from "@shipeasy/sdk/client";
+
+const client = FlagsClientBrowser.forTesting();
+
+client.overrideFlag("new_checkout", true);
+client.overrideConfig("upload_limits", { max_uploads: 50 });
+client.overrideExperiment("hero_cta", "treatment", { primary_label: "Buy now" });
+
+client.getFlag("new_checkout"); // true
+client.getConfig("upload_limits"); // { max_uploads: 50 }
+client.getExperiment("hero_cta", { primary_label: "Sign up" });
+// → { inExperiment: true, group: "treatment", params: { primary_label: "Buy now" } }
+
+client.track("purchase"); // no-op
+client.clearOverrides();
+```
+
+The `override*` setters also work on a **normal** client (not just `forTesting()`),
+mirroring Statsig — a programmatic override always wins over the fetched values.
+In the browser the precedence is: programmatic override > URL/devtools override
+(`?se_gate_…` / `?se_config_…` / `?se_exp_…`) > the server's evaluation.
+
+**API:**
+
+```ts
+overrideFlag(name: string, value: boolean): void;
+overrideConfig(name: string, value: unknown): void;
+overrideExperiment(name: string, group: string, params: Record<string, unknown>): void;
+clearOverrides(): void;
+```
+
 ## Devtools overlay
 
 Press `Shift+Alt+S` on any page running the SDK (or append `?se=1` to the
