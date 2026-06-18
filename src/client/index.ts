@@ -57,6 +57,43 @@ export interface ExperimentResult<P> {
   params: P;
 }
 
+/**
+ * Why a flag evaluated the way it did (LaunchDarkly variationDetail parity).
+ * Computed at the client boundary:
+ *   - CLIENT_NOT_READY — no eval result yet (identify() hasn't resolved)
+ *   - FLAG_NOT_FOUND   — the gate name isn't present in the eval result
+ *   - OFF              — folded into DEFAULT here (the server pre-evaluates the
+ *     gate's enabled/killed state into a plain boolean, so the browser can't
+ *     distinguish a disabled gate from one a rule denied)
+ *   - OVERRIDE         — a local override or a ?se_gate_/?se_ks_ URL override
+ *     decided the value
+ *   - RULE_MATCH       — the gate evaluated true
+ *   - DEFAULT          — the gate evaluated false
+ */
+export const FLAG_REASONS = [
+  "CLIENT_NOT_READY",
+  "FLAG_NOT_FOUND",
+  "OFF",
+  "OVERRIDE",
+  "RULE_MATCH",
+  "DEFAULT",
+] as const;
+export type FlagReason = (typeof FLAG_REASONS)[number];
+
+export interface FlagDetail {
+  value: boolean;
+  reason: FlagReason;
+}
+
+/** Options object form of `getConfig` — keeps the legacy `decode` callback and
+ *  adds a `defaultValue` returned when the config key is absent. */
+export interface GetConfigOptions<T = unknown> {
+  /** Decode the raw stored value into the typed shape callers want. */
+  decode?: (raw: unknown) => T;
+  /** Returned when the config key is absent (not overridden, not in the eval result). */
+  defaultValue?: T;
+}
+
 interface EvalExpResult {
   inExperiment: boolean;
   group: string;
@@ -1053,30 +1090,66 @@ export class FlagsClientBrowser {
     this.experimentOverrides.clear();
   }
 
-  getFlag(name: string): boolean {
-    this.telemetry.emit("gate", name);
+  /**
+   * Evaluate a gate and report WHY (LaunchDarkly variationDetail parity). A
+   * local override OR a ?se_gate_/?se_ks_ URL override short-circuits BEFORE
+   * telemetry; otherwise exactly one "gate" beacon is emitted. The server
+   * pre-evaluates a gate's enabled/killed state into a plain boolean, so OFF
+   * folds into DEFAULT here (the browser can't tell "disabled" from "rule
+   * denied").
+   */
+  getFlagDetail(name: string): FlagDetail {
+    // 1. Local override wins and skips telemetry (mirrors the override path).
     const pov = this.flagOverrides.get(name);
-    if (pov !== undefined) return pov;
-    if (this.evalResult === null) return false;
-    const ov = readGateOverride(name);
-    if (ov !== null) return ov;
-    return this.evalResult.flags[name] ?? false;
+    if (pov !== undefined) return { value: pov, reason: "OVERRIDE" };
+    // A URL override is likewise a forced value — short-circuit before telemetry.
+    const urlOv = readGateOverride(name);
+    if (urlOv !== null) return { value: urlOv, reason: "OVERRIDE" };
+    // Single telemetry emit for every non-override path.
+    this.telemetry.emit("gate", name);
+    // 2. No eval result yet.
+    if (this.evalResult === null) return { value: false, reason: "CLIENT_NOT_READY" };
+    // 3. Gate absent from the eval result.
+    if (!(name in this.evalResult.flags)) return { value: false, reason: "FLAG_NOT_FOUND" };
+    // 5. (OFF folds into DEFAULT — see doc comment.)
+    const value = this.evalResult.flags[name] ?? false;
+    return { value, reason: value ? "RULE_MATCH" : "DEFAULT" };
   }
 
-  getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined {
+  /**
+   * Read a feature gate. Returns `defaultValue` ONLY when the gate cannot be
+   * evaluated (not ready or flag not found) — never for a gate that legitimately
+   * evaluates to false. Plain `getFlag(name)` keeps returning false for a
+   * missing flag.
+   */
+  getFlag(name: string, defaultValue = false): boolean {
+    const d = this.getFlagDetail(name);
+    if (d.reason === "CLIENT_NOT_READY" || d.reason === "FLAG_NOT_FOUND") return defaultValue;
+    return d.value;
+  }
+
+  getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined;
+  getConfig<T = unknown>(name: string, opts: GetConfigOptions<T>): T;
+  getConfig<T = unknown>(
+    name: string,
+    decodeOrOpts?: ((raw: unknown) => T) | GetConfigOptions<T>,
+  ): T | undefined {
     this.telemetry.emit("config", name);
+    const opts: GetConfigOptions<T> =
+      typeof decodeOrOpts === "function" ? { decode: decodeOrOpts } : (decodeOrOpts ?? {});
+    const fallback = ("defaultValue" in opts ? opts.defaultValue : undefined) as T | undefined;
     const hasProgrammatic = this.configOverrides.has(name);
-    if (!hasProgrammatic && this.evalResult === null) return undefined;
+    if (!hasProgrammatic && this.evalResult === null) return fallback;
     const urlOv = hasProgrammatic ? undefined : readConfigOverride(name);
     const raw = hasProgrammatic
       ? this.configOverrides.get(name)
       : urlOv !== undefined
         ? urlOv
         : this.evalResult?.configs?.[name];
-    if (raw === undefined) return undefined;
-    if (!decode) return raw as T;
+    if (raw === undefined) return fallback;
+    if (!opts.decode) return raw as T;
     try {
-      return decode(raw);
+      return opts.decode(raw);
     } catch (err) {
       console.warn(`[shipeasy] getConfig('${name}') decode failed:`, String(err));
       return undefined;
@@ -1606,12 +1679,19 @@ export const flags = {
    * Everything else gates on _mountedAndReady to prevent hydration mismatches on
    * force-static pages where SSR has no flag data.
    */
-  get(name: string): boolean {
+  get(name: string, defaultValue = false): boolean {
     const bs = getBootstrap();
     if (bs !== null && name in bs.flags) return bs.flags[name];
-    if (!_mountedAndReady) return false;
-    if (_client) return _client.getFlag(name); // includes URL overrides + evalResult
-    return readGateOverride(name) ?? false;
+    if (!_mountedAndReady) return defaultValue;
+    if (_client) return _client.getFlag(name, defaultValue); // includes URL overrides + evalResult
+    return readGateOverride(name) ?? defaultValue;
+  },
+  /** Evaluate a gate and report why (value + reason). See {@link FlagDetail}. */
+  getDetail(name: string): FlagDetail {
+    if (_client) return _client.getFlagDetail(name);
+    const ov = readGateOverride(name);
+    if (ov !== null) return { value: ov, reason: "OVERRIDE" };
+    return { value: false, reason: "CLIENT_NOT_READY" };
   },
   getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined {
     const bs = getBootstrap();

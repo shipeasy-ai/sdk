@@ -190,6 +190,104 @@ overrideExperiment(name: string, group: string, params: Record<string, unknown>)
 clearOverrides(): void;
 ```
 
+## Default values
+
+`getFlag` / `getConfig` take a caller-supplied default that is returned **only
+when the value can't be evaluated** — the client isn't initialized yet, or the
+key isn't in the loaded rules. A flag that legitimately evaluates to `false`
+(disabled, rule denied, rolled out to 0%) still returns `false`, never the
+default.
+
+```ts
+// Server
+flags.get("new_checkout", { user_id: "u1" });        // false for a missing flag
+flags.get("new_checkout", { user_id: "u1" }, true);  // true only if not-ready/not-found
+flags.getConfig("limits", { defaultValue: { max: 50 } }); // default when key absent
+
+// Browser (no user arg)
+client.getFlag("new_checkout");        // false for a missing flag
+client.getFlag("new_checkout", true);  // default when not-ready/not-found
+client.getConfig("limits", { defaultValue: { max: 50 } });
+```
+
+The legacy `getConfig(name, decode)` callback signature still works unchanged;
+the options object (`{ decode?, defaultValue? }`) is the new, additive form.
+
+## Evaluation detail
+
+`getFlagDetail(name[, user])` returns `{ value, reason }` (LaunchDarkly
+`variationDetail` parity) so you can see *why* a flag resolved the way it did:
+
+```ts
+import type { FlagReason } from "@shipeasy/sdk/server"; // or /client
+
+const d = client.getFlagDetail("new_checkout", { user_id: "u1" });
+// → { value: true, reason: "RULE_MATCH" }
+```
+
+`FlagReason` is one of:
+
+| reason             | meaning                                                     |
+| ------------------ | ---------------------------------------------------------- |
+| `CLIENT_NOT_READY` | no rules loaded yet (`init()` / `identify()` pending)      |
+| `FLAG_NOT_FOUND`   | the gate name isn't in the loaded rules                    |
+| `OFF`              | the gate exists but is disabled / killed (server only)     |
+| `OVERRIDE`         | a local override (or `?se_gate_…` URL override) decided it |
+| `RULE_MATCH`       | the gate evaluated `true`                                  |
+| `DEFAULT`          | the gate evaluated `false`                                 |
+
+`getFlag` is implemented on top of `getFlagDetail` (single evaluation, single
+telemetry beacon). On the browser the server pre-evaluates the gate's
+enabled/killed state into a boolean, so `OFF` folds into `DEFAULT` there.
+
+## Change listeners
+
+The server `FlagsClient` fires registered listeners after a **background poll
+returns new data** (HTTP 200, not 304) — handy for invalidating a cache or
+re-rendering when a flag flips. Returns an unsubscribe function. Never fires in
+test/offline mode (no polling happens):
+
+```ts
+const client = new FlagsClient({ apiKey: process.env.SHIPEASY_SERVER_KEY! });
+await client.init();
+const unsubscribe = client.onChange(() => {
+  console.log("flag rules changed — re-evaluating");
+});
+// later…
+unsubscribe();
+```
+
+The browser `FlagsClientBrowser` already exposes the equivalent `subscribe()`
+(fires after each `identify()` / override change).
+
+## Offline snapshot
+
+Build a fully offline server client from a captured snapshot — zero network.
+Evaluations run the real eval against the snapshot; `init()`/`initOnce()`/
+`track()` are no-ops and overrides still apply on top. The snapshot is just the
+two SDK wire bodies:
+
+```jsonc
+// snapshot.json
+{
+  "flags":       /* body of GET /sdk/flags */,
+  "experiments": /* body of GET /sdk/experiments */
+}
+```
+
+```ts
+import { FlagsClient } from "@shipeasy/sdk/server";
+
+const client = FlagsClient.fromFile("./snapshot.json");
+// or, if you already hold the parsed object:
+const client = FlagsClient.fromSnapshot({ flags, experiments });
+
+client.getFlag("new_checkout", { user_id: "u1" });
+```
+
+`fromFile` is Node-only (it reads the file with `node:fs`); `fromSnapshot` works
+anywhere.
+
 ## Devtools overlay
 
 Press `Shift+Alt+S` on any page running the SDK (or append `?se=1` to the

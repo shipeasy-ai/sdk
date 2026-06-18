@@ -104,6 +104,40 @@ export interface ExperimentResult<P> {
   params: P;
 }
 
+/**
+ * Why a flag evaluated the way it did (LaunchDarkly variationDetail parity).
+ * Computed at the client boundary, never inside the canonical eval:
+ *   - CLIENT_NOT_READY — no rules blob loaded yet (init()/initOnce() pending)
+ *   - FLAG_NOT_FOUND   — the gate name isn't present in the loaded blob
+ *   - OFF              — the gate exists but is disabled / killed
+ *   - OVERRIDE         — a local override (overrideFlag) decided the value
+ *   - RULE_MATCH       — the gate evaluated true (rules + rollout passed)
+ *   - DEFAULT          — the gate evaluated false (a rule or the rollout denied)
+ */
+export const FLAG_REASONS = [
+  "CLIENT_NOT_READY",
+  "FLAG_NOT_FOUND",
+  "OFF",
+  "OVERRIDE",
+  "RULE_MATCH",
+  "DEFAULT",
+] as const;
+export type FlagReason = (typeof FLAG_REASONS)[number];
+
+export interface FlagDetail {
+  value: boolean;
+  reason: FlagReason;
+}
+
+/** Options object form of `getConfig` — keeps the legacy `decode` callback and
+ *  adds a `defaultValue` returned when the config key is absent. */
+export interface GetConfigOptions<T = unknown> {
+  /** Decode the raw stored value into the typed shape callers want. */
+  decode?: (raw: unknown) => T;
+  /** Returned when the config key is absent (not overridden, not in the blob). */
+  defaultValue?: T;
+}
+
 interface GateRule {
   attr: string;
   op: "eq" | "neq" | "in" | "not_in" | "gt" | "gte" | "lt" | "lte" | "contains" | "regex";
@@ -142,7 +176,8 @@ interface Killswitch {
   switches?: Record<string, 0 | 1 | boolean>;
 }
 
-interface FlagsBlob {
+/** Body of `GET /sdk/flags` — the snapshot's `flags` field. See {@link FlagsClient.fromSnapshot}. */
+export interface FlagsBlob {
   version: string;
   plan: string;
   gates: Record<string, Gate>;
@@ -150,7 +185,8 @@ interface FlagsBlob {
   killswitches: Record<string, Killswitch>;
 }
 
-interface ExpsBlob {
+/** Body of `GET /sdk/experiments` — the snapshot's `experiments` field. See {@link FlagsClient.fromSnapshot}. */
+export interface ExpsBlob {
   version: string;
   universes: Record<string, Universe>;
   experiments: Record<string, Experiment>;
@@ -363,6 +399,9 @@ export class FlagsClient {
     string,
     { group: string; params: Record<string, unknown> }
   >();
+  // Change listeners fired after a background poll returns NEW data (200, not
+  // 304). Never fired in testMode/offline (no polling happens there).
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(opts: FlagsClientOptions) {
     this.apiKey = opts.apiKey;
@@ -401,6 +440,40 @@ export class FlagsClient {
    */
   static forTesting(opts?: Partial<FlagsClientOptions>): FlagsClient {
     return new FlagsClient({ apiKey: "", ...opts, testMode: true });
+  }
+
+  /**
+   * Build a fully OFFLINE client from a pre-captured snapshot — no network ever.
+   * Reuses the test-mode plumbing (init()/initOnce()/track() are no-ops,
+   * telemetry off) but, unlike forTesting(), seeds the REAL flags + experiments
+   * blobs so evaluations run the canonical eval against the snapshot. Local
+   * overrides still apply on top.
+   *
+   * Snapshot shape mirrors the wire bodies:
+   * `{ flags: <GET /sdk/flags body>, experiments: <GET /sdk/experiments body> }`.
+   */
+  static fromSnapshot(snapshot: { flags: FlagsBlob; experiments: ExpsBlob }): FlagsClient {
+    const client = new FlagsClient({ apiKey: "", testMode: true });
+    client.flagsBlob = snapshot.flags;
+    client.expsBlob = snapshot.experiments;
+    client.initialized = true;
+    return client;
+  }
+
+  /**
+   * Build a fully OFFLINE client from a snapshot JSON file on disk (Node only —
+   * not available in the browser entrypoint). The file must contain
+   * `{ "flags": <GET /sdk/flags body>, "experiments": <GET /sdk/experiments body> }`.
+   * See {@link FlagsClient.fromSnapshot}.
+   */
+  static fromFile(path: string): FlagsClient {
+    // require() so the Node-only fs dependency never ends up in a browser bundle
+    // of the server entry (this static is documented as Node/server-only).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const fs = require("node:fs") as typeof import("node:fs");
+    const raw = fs.readFileSync(path, "utf8");
+    const snapshot = JSON.parse(raw) as { flags: FlagsBlob; experiments: ExpsBlob };
+    return FlagsClient.fromSnapshot(snapshot);
   }
 
   async init(): Promise<void> {
@@ -453,16 +526,40 @@ export class FlagsClient {
     }
   }
 
+  /**
+   * Subscribe to data-change notifications. The listener fires after a
+   * background poll fetch returns NEW data (200, not 304) — i.e. after the
+   * cached blob is updated. Never fires in testMode/offline (no polling).
+   * Returns an unsubscribe function.
+   */
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const l of this.changeListeners) {
+      try {
+        l();
+      } catch (err) {
+        console.warn("[shipeasy] onChange listener threw:", String(err));
+      }
+    }
+  }
+
   private startPoll(): void {
     this.timer = setInterval(() => {
-      this.fetchAll().catch((err) =>
+      this.fetchAll(true).catch((err) =>
         console.warn("[shipeasy] background poll failed:", String(err)),
       );
     }, this.pollInterval * 1000);
   }
 
-  private async fetchAll(): Promise<void> {
-    const [interval] = await Promise.all([this.fetchFlags(), this.fetchExps()]);
+  private async fetchAll(fromPoll = false): Promise<void> {
+    const [flagsRes, expsChanged] = await Promise.all([this.fetchFlags(), this.fetchExps()]);
+    const { interval, changed: flagsChanged } = flagsRes;
     if (interval !== null && interval !== this.pollInterval) {
       this.pollInterval = interval;
       if (this.timer !== null) {
@@ -470,49 +567,94 @@ export class FlagsClient {
         this.startPoll();
       }
     }
+    // Only fire on a background poll that brought NEW data (200, not 304) — the
+    // initial init() fetch isn't a "change", and 304s leave the blob untouched.
+    if (fromPoll && (flagsChanged || expsChanged)) this.notifyChange();
   }
 
-  private async fetchFlags(): Promise<number | null> {
+  private async fetchFlags(): Promise<{ interval: number | null; changed: boolean }> {
     const headers: Record<string, string> = { "X-SDK-Key": this.apiKey };
     if (this.flagsEtag) headers["If-None-Match"] = this.flagsEtag;
     const res = await globalThis.fetch(`${this.baseUrl}/sdk/flags?env=${this.env}`, { headers });
     const interval = Number(res.headers.get("X-Poll-Interval") ?? "30") || 30;
-    if (res.status === 304) return interval;
+    if (res.status === 304) return { interval, changed: false };
     if (!res.ok) throw new Error(`/sdk/flags returned ${res.status}`);
     const etag = res.headers.get("ETag");
     if (etag) this.flagsEtag = etag;
     this.flagsBlob = (await res.json()) as FlagsBlob;
-    return interval;
+    return { interval, changed: true };
   }
 
-  private async fetchExps(): Promise<void> {
+  private async fetchExps(): Promise<boolean> {
     const headers: Record<string, string> = { "X-SDK-Key": this.apiKey };
     if (this.expsEtag) headers["If-None-Match"] = this.expsEtag;
     const res = await globalThis.fetch(`${this.baseUrl}/sdk/experiments`, { headers });
-    if (res.status === 304) return;
+    if (res.status === 304) return false;
     if (!res.ok) throw new Error(`/sdk/experiments returned ${res.status}`);
     const etag = res.headers.get("ETag");
     if (etag) this.expsEtag = etag;
     this.expsBlob = (await res.json()) as ExpsBlob;
+    return true;
   }
 
-  getFlag(name: string, user: User): boolean {
-    this.telemetry.emit("gate", name);
+  /**
+   * Evaluate a gate and report WHY (LaunchDarkly variationDetail parity). The
+   * reason is computed entirely at this boundary — the canonical eval
+   * (evalGateInternal) is untouched. A local override short-circuits BEFORE
+   * telemetry, exactly like getFlag's override path; otherwise exactly one
+   * "gate" beacon is emitted.
+   */
+  getFlagDetail(name: string, user: User): FlagDetail {
+    // 1. Local override wins and skips telemetry (mirrors the override path).
     const ov = this.flagOverrides.get(name);
-    if (ov !== undefined) return ov;
-    const gate = this.flagsBlob?.gates[name];
-    if (!gate) return false;
-    return evalGateInternal(gate, user);
+    if (ov !== undefined) return { value: ov, reason: "OVERRIDE" };
+    // Single telemetry emit for every non-override path (steps 2–5).
+    this.telemetry.emit("gate", name);
+    // 2. No rules blob loaded yet.
+    if (!this.flagsBlob) return { value: false, reason: "CLIENT_NOT_READY" };
+    // 3. Gate absent from the loaded blob.
+    const gate = this.flagsBlob.gates[name];
+    if (!gate) return { value: false, reason: "FLAG_NOT_FOUND" };
+    // 4. Gate present but disabled / killed — read the same fields the canonical
+    //    eval reads so the two never drift.
+    if (isEnabled(gate.killswitch) || !isEnabled(gate.enabled)) {
+      return { value: false, reason: "OFF" };
+    }
+    // 5. Real evaluation.
+    const value = evalGateInternal(gate, user);
+    return { value, reason: value ? "RULE_MATCH" : "DEFAULT" };
   }
 
-  getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined {
+  /**
+   * Read a feature gate. Returns `defaultValue` ONLY when the gate cannot be
+   * evaluated (client not initialized or flag not found) — never for a gate that
+   * legitimately evaluates to false. Plain `getFlag(name, user)` keeps returning
+   * false for a missing flag.
+   */
+  getFlag(name: string, user: User, defaultValue = false): boolean {
+    const d = this.getFlagDetail(name, user);
+    if (d.reason === "CLIENT_NOT_READY" || d.reason === "FLAG_NOT_FOUND") return defaultValue;
+    return d.value;
+  }
+
+  getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined;
+  getConfig<T = unknown>(name: string, opts: GetConfigOptions<T>): T;
+  getConfig<T = unknown>(
+    name: string,
+    decodeOrOpts?: ((raw: unknown) => T) | GetConfigOptions<T>,
+  ): T | undefined {
     this.telemetry.emit("config", name);
-    const raw = this.configOverrides.has(name)
-      ? this.configOverrides.get(name)
-      : this.flagsBlob?.configs[name]?.value;
-    if (raw === undefined && !this.configOverrides.has(name)) return undefined;
-    if (!decode) return raw as T;
-    return decode(raw);
+    const opts: GetConfigOptions<T> =
+      typeof decodeOrOpts === "function" ? { decode: decodeOrOpts } : (decodeOrOpts ?? {});
+    const has = this.configOverrides.has(name);
+    const raw = has ? this.configOverrides.get(name) : this.flagsBlob?.configs[name]?.value;
+    // Config key absent (not overridden, not in the blob): return the supplied
+    // default if any, else undefined — backward compatible.
+    if (raw === undefined && !has) {
+      return ("defaultValue" in opts ? opts.defaultValue : undefined) as T;
+    }
+    if (!opts.decode) return raw as T;
+    return opts.decode(raw);
   }
 
   getExperiment<P extends Record<string, unknown>>(
@@ -1307,11 +1449,19 @@ export const flags = {
   destroy(): void {
     _server?.destroy();
   },
-  get(name: string, user: User): boolean {
-    return _server?.getFlag(name, user) ?? false;
+  get(name: string, user: User, defaultValue = false): boolean {
+    return _server?.getFlag(name, user, defaultValue) ?? defaultValue;
   },
-  getConfig<T = unknown>(name: string, decode?: (raw: unknown) => T): T | undefined {
-    return _server?.getConfig(name, decode);
+  /** Evaluate a gate and report why (value + reason). See {@link FlagDetail}. */
+  getDetail(name: string, user: User): FlagDetail {
+    return _server?.getFlagDetail(name, user) ?? { value: false, reason: "CLIENT_NOT_READY" };
+  },
+  getConfig<T = unknown>(
+    name: string,
+    decodeOrOpts?: ((raw: unknown) => T) | GetConfigOptions<T>,
+  ): T | undefined {
+    // Forward the legacy decode callback OR the options object unchanged.
+    return _server?.getConfig(name, decodeOrOpts as GetConfigOptions<T>);
   },
   getExperiment<P extends Record<string, unknown>>(
     name: string,

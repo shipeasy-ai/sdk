@@ -25,6 +25,41 @@
   New methods: `overrideFlag`, `overrideConfig`, `overrideExperiment`,
   `clearOverrides`.
 
+- **Default values on `getFlag` / `getConfig`.** Both clients accept a
+  caller-supplied default returned **only** when the value can't be evaluated
+  (client not initialized or key not found) — never for a flag that legitimately
+  evaluates to `false`. Additive and backward-compatible:
+
+  ```ts
+  client.getFlag("new_checkout", { user_id: "u1" }, true); // server (3rd arg)
+  client.getFlag("new_checkout", true);                    // browser (2nd arg)
+  client.getConfig("limits", { defaultValue: { max: 50 } });
+  ```
+
+  `getConfig` gains an options-object overload `{ decode?, defaultValue? }`; the
+  legacy `getConfig(name, decode)` callback form still works unchanged.
+
+- **Flag evaluation detail (`getFlagDetail`).** LaunchDarkly `variationDetail`
+  parity: `getFlagDetail(name[, user])` returns `{ value, reason }` where
+  `reason: FlagReason` is one of `CLIENT_NOT_READY` | `FLAG_NOT_FOUND` | `OFF` |
+  `OVERRIDE` | `RULE_MATCH` | `DEFAULT`. Computed at the client boundary — the
+  canonical eval is untouched. `getFlag` now delegates to `getFlagDetail` (one
+  evaluation, one telemetry beacon). Exported types: `FlagDetail`, `FlagReason`,
+  `FLAG_REASONS` (from both `/server` and `/client`). On the browser `OFF` folds
+  into `DEFAULT` (the server pre-evaluates the enabled/killed state).
+
+- **Change listeners (server).** `FlagsClient.onChange(listener)` fires after a
+  background poll returns NEW data (HTTP 200, not 304) and returns an
+  unsubscribe function. Never fires in test/offline mode. The browser client's
+  existing `subscribe()` is the equivalent.
+
+- **Offline file/snapshot data source (server).** `FlagsClient.fromFile(path)`
+  (Node `fs`) and `FlagsClient.fromSnapshot({ flags, experiments })` build a
+  fully offline client — no network, telemetry off, `init()`/`initOnce()`/
+  `track()` no-op — that runs the real eval against the snapshot (the two SDK
+  wire bodies, `GET /sdk/flags` + `GET /sdk/experiments`). Overrides still apply
+  on top.
+
 ## 5.0.0
 
 ### Changed (BREAKING)
