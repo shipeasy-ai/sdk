@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Private attributes** (LD/Statsig `privateAttributes`). New
+  `privateAttributes?: string[]` option on both clients (and `shipeasy({…})`):
+  usable for targeting, never persisted in analytics. The server evaluates
+  locally so private attrs never leave for evaluation; the browser sends them to
+  `/sdk/evaluate` under `private_attributes` (the edge must evaluate) but the
+  worker never stores them. On both sides the listed keys are stripped from any
+  `track(props)` payload.
+
 - **Manual / suppressible exposure logging** (Statsig's `disableExposureLogging`
   + `manuallyLogExposure`). The browser `getExperiment` gains an options-object
   overload alongside the positional one, and both clients gain `logExposure`:

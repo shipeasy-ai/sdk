@@ -365,6 +365,13 @@ export interface FlagsClientOptions {
   /** Override the telemetry beacon host. Defaults to {@link DEFAULT_TELEMETRY_URL}. */
   telemetryUrl?: string;
   /**
+   * Attribute names usable for targeting but never persisted in analytics
+   * (LD/Statsig `privateAttributes`). The server evaluates locally so private
+   * attrs never leave for evaluation at all; the only egress is `/collect`, and
+   * the listed keys are stripped from every outbound `track()` payload.
+   */
+  privateAttributes?: string[];
+  /**
    * Test mode — no network at all. init()/initOnce() are no-ops (never fetch),
    * track() is a no-op, telemetry is forced off, and the client starts
    * "initialized" with an empty blob. Prefer the {@link FlagsClient.forTesting}
@@ -377,6 +384,7 @@ export class FlagsClient {
   private readonly apiKey: string;
   private readonly baseUrl: string;
   private readonly env: FlagsClientEnv;
+  private readonly privateAttributes: readonly string[];
   private readonly telemetry: Telemetry;
   private readonly seeLimiter = new SeeLimiter();
   private flagsBlob: FlagsBlob | null = null;
@@ -407,6 +415,7 @@ export class FlagsClient {
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? "https://cdn.shipeasy.ai").replace(/\/$/, "");
     this.env = opts.env ?? "prod";
+    this.privateAttributes = opts.privateAttributes ?? [];
     this.testMode = opts.testMode === true;
     this.telemetry = new Telemetry({
       endpoint: opts.telemetryUrl ?? DEFAULT_TELEMETRY_URL,
@@ -724,8 +733,21 @@ export class FlagsClient {
     return notIn;
   }
 
+  /** Drop caller-marked private attributes from an outbound props bag. */
+  private stripPrivate(
+    props: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!props || this.privateAttributes.length === 0) return props;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(props)) {
+      if (!this.privateAttributes.includes(k)) out[k] = v;
+    }
+    return out;
+  }
+
   track(userId: string, eventName: string, props?: Record<string, unknown>): void {
     if (this.testMode) return; // no-op in test mode — never touch the network
+    const safeProps = this.stripPrivate(props);
     const body = JSON.stringify({
       events: [
         {
@@ -733,7 +755,7 @@ export class FlagsClient {
           event_name: eventName,
           user_id: userId,
           ts: Date.now(),
-          ...(props !== undefined ? { properties: props } : {}),
+          ...(safeProps !== undefined ? { properties: safeProps } : {}),
         },
       ],
     });
@@ -1187,6 +1209,12 @@ export interface ShipeasyServerConfig {
    * that evaluate many flags per request. See {@link FlagsClientOptions.disableTelemetry}.
    */
   disableTelemetry?: boolean;
+  /**
+   * Attribute names usable for targeting but never persisted in analytics
+   * (LD/Statsig `privateAttributes`). Stripped from every outbound `track()`
+   * payload. See {@link FlagsClientOptions.privateAttributes}.
+   */
+  privateAttributes?: string[];
 }
 
 export interface ShipeasyServerHandle {
@@ -1222,7 +1250,11 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     );
   }
   const profile = opts.i18nDefaultProfile ?? "en:prod";
-  flags.configure({ apiKey: serverKey, disableTelemetry: opts.disableTelemetry });
+  flags.configure({
+    apiKey: serverKey,
+    disableTelemetry: opts.disableTelemetry,
+    privateAttributes: opts.privateAttributes,
+  });
   // Resolve URL overrides: explicit opts.urlOverrides wins; otherwise try
   // (a) the x-se-search header (injected by middleware when one is wired up)
   // and (b) the `se_edit_labels` cookie that the inline patcher sets on the

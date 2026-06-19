@@ -707,6 +707,14 @@ export interface FlagsClientBrowserOptions {
    */
   disableAutoExposure?: boolean;
   /**
+   * Attribute names usable for targeting but never persisted in analytics
+   * (LD/Statsig `privateAttributes`). They are sent to `/sdk/evaluate` under
+   * `private_attributes` so the edge can evaluate with them (unavoidable —
+   * the edge evaluates), but the worker never stores them, and the listed keys
+   * are stripped from any `track(props)` payload.
+   */
+  privateAttributes?: string[];
+  /**
    * Test mode — no network at all. identify()/init are no-ops (never call
    * /sdk/evaluate), track() is a no-op, telemetry is forced off, and the client
    * starts "ready" with an empty eval result. Prefer the
@@ -877,6 +885,7 @@ export class FlagsClientBrowser {
   private readonly autoGuardrailGroups: AutoCollectGroups;
   private readonly autoCollectAlways: boolean;
   private readonly disableAutoExposure: boolean;
+  private readonly privateAttributes: readonly string[];
   private readonly env: FlagsClientBrowserEnv;
   private evalResult: EvalResponse | null = null;
   private anonId: string;
@@ -921,6 +930,7 @@ export class FlagsClientBrowser {
     this.autoGuardrails = opts.autoGuardrails !== false;
     this.autoCollectAlways = opts.autoCollectAlways === true;
     this.disableAutoExposure = opts.disableAutoExposure === true;
+    this.privateAttributes = opts.privateAttributes ?? [];
     const g = opts.autoGuardrailGroups ?? {};
     this.autoGuardrailGroups = {
       vitals: g.vitals ?? this.autoGuardrails,
@@ -1003,6 +1013,11 @@ export class FlagsClientBrowser {
       body: JSON.stringify({
         user: userPayload,
         experiment_overrides: readExperimentOverridesFromUrl(),
+        // Private attributes still reach the edge for evaluation (unavoidable —
+        // the edge evaluates), but the worker never persists them. See doc 20 §5.
+        ...(this.privateAttributes.length > 0
+          ? { private_attributes: [...this.privateAttributes] }
+          : {}),
       }),
     });
     if (!res.ok) throw new Error(`/sdk/evaluate returned ${res.status}`);
@@ -1297,7 +1312,19 @@ export class FlagsClientBrowser {
 
   track(eventName: string, props?: Record<string, unknown>): void {
     if (this.testMode) return; // no-op in test mode — never touch the network
-    this.buffer.pushMetric(eventName, this.userId, this.anonId, props);
+    this.buffer.pushMetric(eventName, this.userId, this.anonId, this.stripPrivate(props));
+  }
+
+  /** Drop caller-marked private attributes from an outbound props bag. */
+  private stripPrivate(
+    props: Record<string, unknown> | undefined,
+  ): Record<string, unknown> | undefined {
+    if (!props || this.privateAttributes.length === 0) return props;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(props)) {
+      if (!this.privateAttributes.includes(k)) out[k] = v;
+    }
+    return out;
   }
 
   /**
@@ -1586,6 +1613,13 @@ export interface ShipeasyClientConfig {
    * `flags.logExposure(name)` at the treatment's render to log the exposure.
    */
   disableAutoExposure?: boolean;
+  /**
+   * Attribute names usable for targeting but never persisted in analytics
+   * (LD/Statsig `privateAttributes`). Sent to the edge for evaluation, never
+   * stored, and stripped from `flags.track(props)`. See
+   * {@link FlagsClientBrowserOptions.privateAttributes}.
+   */
+  privateAttributes?: string[];
 }
 
 /**
@@ -1614,6 +1648,7 @@ export function shipeasy(opts: ShipeasyClientConfig): () => void {
     autoCollectAlways: acObj?.always === true,
     disableTelemetry: opts.disableTelemetry,
     disableAutoExposure: opts.disableAutoExposure,
+    privateAttributes: opts.privateAttributes,
   });
   // Inject the runtime i18n loader with the client key. The server no longer
   // does this (it doesn't hold the client key); the SSR shim in __SE_BOOTSTRAP
