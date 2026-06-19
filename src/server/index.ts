@@ -747,6 +747,40 @@ export class FlagsClient {
   }
 
   /**
+   * Emit an exposure event for an experiment at the server-side decision point
+   * (parity with the browser's auto-exposure). The server is stateless and
+   * never auto-logs, so call this when you actually present the treatment.
+   * Re-evaluates the experiment for `user` (a bare `user_id` string is wrapped
+   * as `{ user_id }`); if the user is enrolled, POSTs a single exposure to
+   * `/collect`. No-op in test mode or when the user isn't enrolled.
+   */
+  logExposure(user: string | User, name: string): void {
+    if (this.testMode) return;
+    const u: User = typeof user === "string" ? { user_id: user } : user;
+    const result = this.getExperiment(name, u, {} as Record<string, unknown>);
+    if (!result.inExperiment) return;
+    const body = JSON.stringify({
+      events: [
+        {
+          type: "exposure",
+          experiment: name,
+          group: result.group,
+          ...(u.user_id !== undefined ? { user_id: u.user_id } : {}),
+          ...(u.anonymous_id !== undefined ? { anonymous_id: u.anonymous_id } : {}),
+          ts: Date.now(),
+        },
+      ],
+    });
+    globalThis
+      .fetch(`${this.baseUrl}/collect`, {
+        method: "POST",
+        headers: { "X-SDK-Key": this.apiKey, "Content-Type": "text/plain" },
+        body,
+      })
+      .catch((err) => console.warn("[shipeasy] logExposure failed:", String(err)));
+  }
+
+  /**
    * Report a structured error into the errors primitive. Fire-and-forget —
    * never blocks or throws into the request path. Spam-guarded by a 30s
    * dedup window + per-process cap.
@@ -1487,6 +1521,11 @@ export const flags = {
   },
   track(userId: string, eventName: string, props?: Record<string, unknown>): void {
     _server?.track(userId, eventName, props);
+  },
+  /** Emit an exposure for an enrolled experiment at the decision point. See
+   *  {@link FlagsClient.logExposure}. No-op before configure(). */
+  logExposure(user: string | User, name: string): void {
+    _server?.logExposure(user, name);
   },
   /**
    * Evaluate all flags / configs / experiments for a user against the locally

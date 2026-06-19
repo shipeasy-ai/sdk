@@ -4,6 +4,27 @@
 
 ### Added
 
+- **Manual / suppressible exposure logging** (Statsig's `disableExposureLogging`
+  + `manuallyLogExposure`). The browser `getExperiment` gains an options-object
+  overload alongside the positional one, and both clients gain `logExposure`:
+
+  ```ts
+  // read without logging, then log at the treatment's render:
+  const exp = flags.getExperiment("hero_cta", defaults, { logExposure: false });
+  // ...later, when the treatment actually renders:
+  flags.logExposure("hero_cta");
+
+  // or flip the default for the whole client:
+  shipeasy({ clientKey, disableAutoExposure: true });
+
+  // server records the exposure at the decision point (it never auto-logs):
+  flags.logExposure(userId, "hero_cta");
+  ```
+
+  Per-call `logExposure` wins over the client-level `disableAutoExposure`
+  setting. The existing session dedup set means auto + manual never
+  double-count. No wire change — exposure event shape and dedup are unchanged.
+
 - **OpenFeature providers.** Two new entrypoints let apps standardized on the
   CNCF OpenFeature API plug Shipeasy in as the backing provider — a pure adapter
   over the existing clients, no change to evaluation:

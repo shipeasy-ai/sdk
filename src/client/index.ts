@@ -57,6 +57,21 @@ export interface ExperimentResult<P> {
   params: P;
 }
 
+/** Options object form of `getExperiment` — the legacy `decode`/`variants`
+ *  positional args plus per-call exposure control. */
+export interface GetExperimentOptions<P> {
+  /** Decode the raw stored params into the typed shape callers want. */
+  decode?: (raw: unknown) => P;
+  /** Variant-specific param overrides merged on top of group params. */
+  variants?: Record<string, Partial<P>>;
+  /**
+   * Override automatic exposure logging for this read. Defaults to the client's
+   * setting (`disableAutoExposure` flips it). `false` reads the variant without
+   * logging an exposure — pair with `logExposure(name)` at render time.
+   */
+  logExposure?: boolean;
+}
+
 /**
  * Why a flag evaluated the way it did (LaunchDarkly variationDetail parity).
  * Computed at the client boundary:
@@ -685,6 +700,13 @@ export interface FlagsClientBrowserOptions {
   /** Override the telemetry beacon host. Defaults to {@link DEFAULT_TELEMETRY_URL}. */
   telemetryUrl?: string;
   /**
+   * Suppress automatic exposure logging in `getExperiment` (Statsig's
+   * `disableExposureLogging`). Default false — reading an enrolled variant
+   * auto-logs a deduped exposure. When true, no exposure fires unless you call
+   * `logExposure(name)` yourself, or pass `{ logExposure: true }` per call.
+   */
+  disableAutoExposure?: boolean;
+  /**
    * Test mode — no network at all. identify()/init are no-ops (never call
    * /sdk/evaluate), track() is a no-op, telemetry is forced off, and the client
    * starts "ready" with an empty eval result. Prefer the
@@ -854,6 +876,7 @@ export class FlagsClientBrowser {
   private readonly autoGuardrails: boolean;
   private readonly autoGuardrailGroups: AutoCollectGroups;
   private readonly autoCollectAlways: boolean;
+  private readonly disableAutoExposure: boolean;
   private readonly env: FlagsClientBrowserEnv;
   private evalResult: EvalResponse | null = null;
   private anonId: string;
@@ -897,6 +920,7 @@ export class FlagsClientBrowser {
     // narrowing per-group via `autoGuardrailGroups`.
     this.autoGuardrails = opts.autoGuardrails !== false;
     this.autoCollectAlways = opts.autoCollectAlways === true;
+    this.disableAutoExposure = opts.disableAutoExposure === true;
     const g = opts.autoGuardrailGroups ?? {};
     this.autoGuardrailGroups = {
       vitals: g.vitals ?? this.autoGuardrails,
@@ -1161,7 +1185,25 @@ export class FlagsClientBrowser {
     defaultParams: P,
     decode?: (raw: unknown) => P,
     variants?: Record<string, Partial<P>>,
+  ): ExperimentResult<P>;
+  getExperiment<P extends Record<string, unknown>>(
+    name: string,
+    defaultParams: P,
+    opts: GetExperimentOptions<P>,
+  ): ExperimentResult<P>;
+  getExperiment<P extends Record<string, unknown>>(
+    name: string,
+    defaultParams: P,
+    decodeOrOpts?: ((raw: unknown) => P) | GetExperimentOptions<P>,
+    variantsArg?: Record<string, Partial<P>>,
   ): ExperimentResult<P> {
+    // Discriminate the positional (decode, variants) form from the options form.
+    const opts: GetExperimentOptions<P> =
+      typeof decodeOrOpts === "function"
+        ? { decode: decodeOrOpts, variants: variantsArg }
+        : (decodeOrOpts ?? {});
+    const { decode, variants } = opts;
+
     this.telemetry.emit("experiment", name);
     const notIn: ExperimentResult<P> = {
       inExperiment: false,
@@ -1191,8 +1233,11 @@ export class FlagsClientBrowser {
 
     const entry = this.evalResult?.experiments[name];
     if (!entry || !entry.inExperiment) return notIn;
-    // Auto-log exposure (deduped within session)
-    this.buffer.pushExposure(name, entry.group, this.userId, this.anonId);
+    // Auto-log exposure (deduped within session) unless suppressed. Per-call
+    // `logExposure` wins; otherwise the client-level `disableAutoExposure`
+    // setting decides. The dedup set makes auto + manual never double-count.
+    const shouldLog = opts.logExposure ?? !this.disableAutoExposure;
+    if (shouldLog) this.buffer.pushExposure(name, entry.group, this.userId, this.anonId);
     if (!decode) return { inExperiment: true, group: entry.group, params: entry.params as P };
     try {
       return { inExperiment: true, group: entry.group, params: decode(entry.params) };
@@ -1200,6 +1245,19 @@ export class FlagsClientBrowser {
       console.warn(`[shipeasy] getExperiment('${name}') decode failed:`, String(err));
       return notIn;
     }
+  }
+
+  /**
+   * Manually log an exposure for an enrolled experiment (Statsig's
+   * `manuallyLogExposure`). Reads the cached eval result; if the visitor is in
+   * the experiment, pushes the session-deduped exposure. Pair this with the
+   * render of the treatment when reading with `{ logExposure: false }` (or
+   * `disableAutoExposure: true`). No-op if the visitor isn't enrolled.
+   */
+  logExposure(name: string): void {
+    const entry = this.evalResult?.experiments[name];
+    if (!entry || !entry.inExperiment) return;
+    this.buffer.pushExposure(name, entry.group, this.userId, this.anonId);
   }
 
   /**
@@ -1522,6 +1580,12 @@ export interface ShipeasyClientConfig {
    * counted by Cloudflare's native per-path analytics. Pass `true` to opt out.
    */
   disableTelemetry?: boolean;
+  /**
+   * Suppress automatic exposure logging in `flags.getExperiment` (Statsig's
+   * `disableExposureLogging`). Default false. When true, call
+   * `flags.logExposure(name)` at the treatment's render to log the exposure.
+   */
+  disableAutoExposure?: boolean;
 }
 
 /**
@@ -1549,6 +1613,7 @@ export function shipeasy(opts: ShipeasyClientConfig): () => void {
     autoGuardrailGroups: groups,
     autoCollectAlways: acObj?.always === true,
     disableTelemetry: opts.disableTelemetry,
+    disableAutoExposure: opts.disableAutoExposure,
   });
   // Inject the runtime i18n loader with the client key. The server no longer
   // does this (it doesn't hold the client key); the SSR shim in __SE_BOOTSTRAP
@@ -1718,16 +1783,23 @@ export const flags = {
   getExperiment<P extends Record<string, unknown>>(
     name: string,
     defaultParams: P,
-    decode?: (raw: unknown) => P,
+    decodeOrOpts?: ((raw: unknown) => P) | GetExperimentOptions<P>,
     variants?: Record<string, Partial<P>>,
   ): ExperimentResult<P> {
-    return (
-      _client?.getExperiment(name, defaultParams, decode, variants) ?? {
-        inExperiment: false,
-        group: "control",
-        params: defaultParams,
-      }
-    );
+    const fallback: ExperimentResult<P> = {
+      inExperiment: false,
+      group: "control",
+      params: defaultParams,
+    };
+    if (!_client) return fallback;
+    return typeof decodeOrOpts === "function"
+      ? _client.getExperiment(name, defaultParams, decodeOrOpts, variants)
+      : _client.getExperiment(name, defaultParams, decodeOrOpts ?? {});
+  },
+  /** Manually log an exposure for an enrolled experiment. See
+   *  {@link FlagsClientBrowser.logExposure}. No-op before configure(). */
+  logExposure(name: string): void {
+    _client?.logExposure(name);
   },
   track(eventName: string, props?: Record<string, unknown>): void {
     _client?.track(eventName, props);
