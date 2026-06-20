@@ -53,6 +53,47 @@ const client = new FlagsClient({ sdkKey: process.env.SHIPEASY_SERVER_KEY! });
 const cfg = await client.getConfig("plan_limits", { user_id: "u-1" });
 ```
 
+## SSR bootstrap (flags on first paint)
+
+Server-render the evaluated flags / configs / experiments into the page so the
+browser SDK reads them **synchronously on first paint** — no flash, no extra
+round-trip. The `shipeasy()` server handle emits two declarative `<script>`
+tags. **No SDK key is embedded** in the bootstrap tag (the server key never
+reaches the browser).
+
+```tsx
+// app/layout.tsx — Next.js root layout (React Server Component)
+import { shipeasy } from "@shipeasy/sdk/server";
+
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const se = await shipeasy({ serverKey: process.env.SHIPEASY_SERVER_KEY ?? "" });
+  const boot = se.getBootstrapData({
+    // public client key — lets the i18n loader revalidate strings at runtime
+    clientKey: process.env.NEXT_PUBLIC_SHIPEASY_CLIENT_KEY,
+  });
+  return (
+    <html>
+      <body>
+        {/* Render REAL <script> elements — scripts set via
+            dangerouslySetInnerHTML do NOT execute. */}
+        <script src={boot.bootstrap.src} {...boot.bootstrap.attrs} />
+        {boot.i18nLoader && <script src={boot.i18nLoader.src} {...boot.i18nLoader.attrs} />}
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+`bootstrap.src` is `https://cdn.shipeasy.ai/sdk/bootstrap.js` — a static loader
+that reads its own `data-*` attributes, hydrates `window.__SE_BOOTSTRAP`, and
+persists the `__se_anon_id` cookie so the browser buckets **identically** to the
+server. The i18n loader tag carries the SSR strings (`data-strings`) for a
+no-flash first paint plus the public client key for runtime revalidation.
+
+For non-React SSR (Express, raw templates), `se.getBootstrapTags()` returns the
+same two tags as an HTML string you can drop straight into the served markup.
+
 ## Error tracking — `see()`
 
 `see` (shipeasy error) is the structured error reporter — opes-style: every
