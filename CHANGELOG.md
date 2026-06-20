@@ -1,5 +1,31 @@
 # Changelog
 
+## 5.4.0 (2026-06-20)
+
+### Added
+
+- **SSR bootstrap as declarative `<script>` tags.** The `shipeasy()` server
+  handle now exposes `getBootstrapData()` (structured tag specs) and
+  `getBootstrapTags()` (HTML string), replacing the old `getBootstrapHtml()`
+  inline-JS blob. The browser reads the SSR-evaluated flags/configs/experiments
+  on first paint with no flash: `getBootstrapData()` returns a `bootstrap` tag
+  (`src=cdn.shipeasy.ai/sdk/bootstrap.js` + `data-*` attributes, **no key**) and
+  an optional `i18nLoader` tag carrying the SSR strings (`data-strings`) plus the
+  public client key for runtime revalidation. The static loader hydrates
+  `window.__SE_BOOTSTRAP` and persists the `__se_anon_id` cookie so the browser
+  buckets identically to the server. Render real `<script>` elements in React
+  (scripts set via `dangerouslySetInnerHTML` do not execute); use
+  `getBootstrapTags()` for non-React SSR.
+
+### Changed
+
+- The client now also reads the bootstrap payload directly off the
+  `se-bootstrap.js` tag's `data-*` attributes as a fallback, so synchronous
+  first-render flag reads stay correct even before the external loader executes.
+- The edit-labels marker shim moved out of the SSR script into the devtools
+  bundle (it owns the label-editing loop). `isEditLabelsMode()` now reads the
+  `se_edit_labels` cookie directly.
+
 ## 5.2.0 (2026-06-19)
 
 ### Added
