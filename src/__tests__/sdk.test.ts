@@ -734,30 +734,36 @@ describe("server shipeasy() — single server key, no client key", () => {
     expect(i18nCall?.key).toBe("srv_key_123");
   });
 
-  it("getBootstrapHtml embeds no SDK key (server key must never reach the browser)", async () => {
+  it("bootstrap tags embed no SDK key (server key must never reach the browser)", async () => {
     vi.resetModules();
     stubFetchOk();
     vi.spyOn(console, "error").mockImplementation(() => {});
     const { shipeasy } = await import("../server");
     const handle = await shipeasy({ serverKey: "srv_key_secret" });
-    const html = handle.getBootstrapHtml();
-    expect(html).not.toContain("srv_key_secret");
-    expect(html).not.toContain("apiKey");
+    const tags = handle.getBootstrapTags();
+    const data = handle.getBootstrapData();
+    expect(tags).not.toContain("srv_key_secret");
+    expect(tags).not.toContain("apiKey");
+    // The bootstrap tag carries no key attribute of any kind.
+    expect(data.bootstrap.attrs["data-key"]).toBeUndefined();
+    expect(JSON.stringify(data.bootstrap.attrs)).not.toContain("srv_key_secret");
+    // It points at the static, cross-platform loader.
+    expect(data.bootstrap.src).toContain("/sdk/bootstrap.js");
+    expect(data.bootstrap.attrs).toHaveProperty("data-se-bootstrap");
   });
 
-  it("mints + bootstraps a __se_anon_id when no user/cookie is present", async () => {
+  it("mints + emits a __se_anon_id on the bootstrap tag when no user/cookie is present", async () => {
     vi.resetModules();
     stubFetchOk();
     vi.spyOn(console, "error").mockImplementation(() => {});
     const { shipeasy } = await import("../server");
     // No next/headers in this runtime → no cookie; server mints one.
     const handle = await shipeasy({ serverKey: "srv_key" });
-    const html = handle.getBootstrapHtml();
-    // The minted id is both written to the cookie (pre-paint) and exposed in the
-    // bootstrap payload so the browser SDK adopts the exact same bucketing unit.
-    expect(html).toContain("__se_anon_id");
-    expect(html).toMatch(/"anonId":"[^"]+"/);
-    expect(html).toContain("document.cookie");
+    const data = handle.getBootstrapData();
+    // The minted id rides data-anon-id; se-bootstrap.js writes the cookie +
+    // exposes it so the browser SDK adopts the exact same bucketing unit.
+    expect(data.bootstrap.attrs["data-anon-id"]).toMatch(/^[^"]+$/);
+    expect(handle.getBootstrapTags()).toContain("data-anon-id");
   });
 
   it("buckets against an explicitly-passed user (no anon override)", async () => {
@@ -769,9 +775,23 @@ describe("server shipeasy() — single server key, no client key", () => {
       serverKey: "srv_key",
       user: { user_id: "u-123" },
     });
-    const html = handle.getBootstrapHtml();
+    const data = handle.getBootstrapData();
     // Authenticated caller → no anonymous id is minted or emitted.
-    expect(html).not.toMatch(/"anonId":/);
+    expect(data.bootstrap.attrs["data-anon-id"]).toBeUndefined();
+    expect(handle.getBootstrapTags()).not.toContain("data-anon-id");
+  });
+
+  it("emits a keyed i18n loader tag with SSR strings when a client key is passed", async () => {
+    vi.resetModules();
+    stubFetchOk();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { shipeasy } = await import("../server");
+    const handle = await shipeasy({ serverKey: "srv_key" });
+    const data = handle.getBootstrapData({ clientKey: "client_pub_key" });
+    expect(data.i18nLoader).not.toBeNull();
+    expect(data.i18nLoader?.src).toContain("/sdk/i18n/loader.js");
+    expect(data.i18nLoader?.attrs["data-key"]).toBe("client_pub_key");
+    expect(data.i18nLoader?.attrs["data-profile"]).toBe("en:prod");
   });
 });
 

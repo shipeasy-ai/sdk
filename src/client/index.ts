@@ -701,8 +701,10 @@ function getOrCreateAnonId(): string {
   // Cookie name + format are a cross-SDK contract: experiment-platform/18-identity-bucketing.md.
   let id: string | null = readAnonCookie();
   if (!id && typeof window !== "undefined") {
-    id =
-      (window as { __SE_BOOTSTRAP?: { anonId?: string } }).__SE_BOOTSTRAP?.anonId ?? null;
+    // getBootstrap() also reads the se-bootstrap.js tag attributes directly, so
+    // the anon id is available even before the external loader runs / sets the
+    // cookie.
+    id = (getBootstrap() as { anonId?: string } | null)?.anonId ?? null;
   }
   if (!id) {
     try {
@@ -1777,6 +1779,17 @@ let _i18nLoaderInjected = false;
 function injectI18nLoader(clientKey: string, baseUrl: string, profileOpt?: string): void {
   if (_i18nLoaderInjected || typeof document === "undefined") return;
   if (!clientKey || typeof document.createElement !== "function" || !document.head) return;
+  // The server SDK now emits the loader tag (with SSR strings + the public
+  // client key) directly into the SSR HTML. If a keyed loader is already
+  // present, it owns runtime revalidation — don't inject a duplicate.
+  try {
+    if (document.querySelector?.('script[src*="/sdk/i18n/loader.js"][data-key]')) {
+      _i18nLoaderInjected = true;
+      return;
+    }
+  } catch {
+    /* querySelector unavailable — fall through and inject */
+  }
   _i18nLoaderInjected = true;
   try {
     const bs = getBootstrap();
@@ -1810,13 +1823,50 @@ export interface BootstrapPayload {
   /** i18n profile the server rendered with, so the client loader matches. No key is embedded. */
   i18nProfile?: string;
   apiUrl?: string;
-  /** When true, tEl() returns marker-wrapped strings for devtools label editing. */
-  editLabels?: boolean;
+  /** Stable anonymous bucketing id the server evaluated against (cross-SDK contract). */
+  anonId?: string;
+}
+
+// Parsed once from the bootstrap tag and reused. The tag is static SSR markup,
+// so a found payload never goes stale within a page.
+let _bootstrapFromTag: BootstrapPayload | null = null;
+
+/**
+ * Read the SSR payload straight off the se-bootstrap.js tag's data-* attributes.
+ * The external loader normally hydrates window.__SE_BOOTSTRAP, but it may not
+ * have executed yet (or 404 in local dev) — the attributes are in the DOM from
+ * first paint, so this keeps synchronous first-render flag reads correct.
+ */
+function readBootstrapTag(): BootstrapPayload | null {
+  if (_bootstrapFromTag) return _bootstrapFromTag;
+  if (typeof document === "undefined" || typeof document.querySelector !== "function") return null;
+  const el = document.querySelector("script[data-se-bootstrap]");
+  if (!el) return null;
+  const J = (name: string): Record<string, unknown> => {
+    try {
+      return JSON.parse(el.getAttribute(name) || "{}") as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  };
+  const bs = {
+    flags: J("data-flags") as Record<string, boolean>,
+    configs: J("data-configs"),
+    experiments: J("data-experiments") as BootstrapPayload["experiments"],
+    killswitches: J("data-killswitches") as BootstrapPayload["killswitches"],
+    i18nProfile: el.getAttribute("data-i18n-profile") || undefined,
+    apiUrl: el.getAttribute("data-api-url") || undefined,
+    anonId: el.getAttribute("data-anon-id") || undefined,
+  } as BootstrapPayload & { anonId?: string };
+  _bootstrapFromTag = bs;
+  return bs;
 }
 
 function getBootstrap(): BootstrapPayload | null {
   if (typeof window === "undefined") return null;
-  return (window as unknown as { __SE_BOOTSTRAP?: BootstrapPayload }).__SE_BOOTSTRAP ?? null;
+  const g = (window as unknown as { __SE_BOOTSTRAP?: BootstrapPayload }).__SE_BOOTSTRAP;
+  if (g) return g;
+  return readBootstrapTag();
 }
 
 // One-way latch set by FlagsBoundary after React hydration completes.
@@ -2141,11 +2191,14 @@ const _EDIT_MODE_FALLBACK_SYM = Symbol.for("@shipeasy/sdk:ssr-edit-mode-fallback
 
 function isEditLabelsMode(): boolean {
   if (typeof window !== "undefined") {
-    // Client: check bootstrap payload (set by server) or live URL param.
-
+    // Client: live URL param OR the persisted se_edit_labels cookie. The cookie
+    // is what keeps edit mode (and marker emission) alive across navigations
+    // after the first ?se_edit_labels=1 visit — matching the server resolution
+    // and the devtools detection, so SSR and client agree without the payload
+    // carrying an editLabels flag.
     return (
-      !!(window as any).__SE_BOOTSTRAP?.editLabels ||
-      new URLSearchParams(location.search).has("se_edit_labels")
+      new URLSearchParams(location.search).has("se_edit_labels") ||
+      /(?:^|;\s*)se_edit_labels=1(?:;|$)/.test(document.cookie)
     );
   }
   // SSR: read directly from globalThis where the server SDK writes it.

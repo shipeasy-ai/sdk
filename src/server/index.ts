@@ -1300,8 +1300,22 @@ export interface ShipeasyServerHandle {
   flags: Record<string, boolean>;
   configs: Record<string, unknown>;
   experiments: Record<string, ExperimentResult<Record<string, unknown>>>;
-  /** Returns a vanilla-JS string for a single inline <script> tag. */
-  getBootstrapHtml(): string;
+  /**
+   * Structured `<script>` tag specs to drop into the document head: the
+   * cross-platform `se-bootstrap.js` tag (hydrates window.__SE_BOOTSTRAP +
+   * writes the anon cookie) and, when there are SSR strings or a client key,
+   * the i18n loader tag. Use this in React: scripts inserted via
+   * `dangerouslySetInnerHTML` do NOT execute, so render real `<script>`
+   * elements from these specs (see apps/ui root layout).
+   */
+  getBootstrapData(emit?: BootstrapEmitOptions): BootstrapData;
+  /**
+   * The same tags rendered as an HTML string, for non-React SSR (Express, raw
+   * templates) where the markup is emitted directly into the served HTML (and
+   * therefore executes normally). This is the canonical cross-platform shape
+   * every server SDK mirrors.
+   */
+  getBootstrapTags(emit?: BootstrapEmitOptions): string;
 }
 
 /**
@@ -1419,155 +1433,148 @@ export async function shipeasy(opts: ShipeasyServerConfig): Promise<ShipeasyServ
     flags: bootstrap.flags,
     configs: bootstrap.configs,
     experiments: bootstrap.experiments,
-    getBootstrapHtml() {
-      return getBootstrapHtml(bootstrap, i18nData, {
-        editLabels,
+    getBootstrapData(emit?: BootstrapEmitOptions) {
+      return getBootstrapData(bootstrap, i18nData, {
         i18nProfile: profile,
         anonId,
+        ...emit,
+      });
+    },
+    getBootstrapTags(emit?: BootstrapEmitOptions) {
+      return getBootstrapTags(bootstrap, i18nData, {
+        i18nProfile: profile,
+        anonId,
+        ...emit,
       });
     },
   };
 }
 
-// ---- Framework-agnostic bootstrap script helper ----
+// ---- Framework-agnostic bootstrap tag helpers ----
+//
+// The SSR payload now rides DECLARATIVE <script> tags carrying data-* attrs,
+// not a server-generated inline JS blob. Two tags:
+//   1. <script src=".../sdk/bootstrap.js" data-se-bootstrap data-flags=… …>
+//      — the loader reads its own attrs, hydrates window.__SE_BOOTSTRAP (NO
+//      key) and writes the __se_anon_id cookie pre-paint.
+//   2. <script src=".../sdk/i18n/loader.js" data-profile data-strings …>
+//      — installs SSR strings for first paint (no flash, no fetch); with a
+//      client key it also revalidates at runtime.
+// Because the data is declarative, EVERY server SDK emits the same markup —
+// this TS helper is just the reference implementation.
+//
+// The old inline edit-labels shim moved to the devtools bundle (it owns the
+// whole label-editing loop); the old inline i18n shim is replaced by the
+// loader's data-strings path.
 
-export interface BootstrapHtmlOptions {
-  /** i18n profile recorded in the bootstrap so the client loader matches SSR. Defaults to "en:prod". */
+export interface BootstrapEmitOptions {
+  /** i18n profile recorded on both tags so the client loader matches SSR. Defaults to "en:prod". */
   i18nProfile?: string;
-  /** When true, tEl() embeds label markers so the devtools can highlight them. */
-  editLabels?: boolean;
   /**
-   * Stable anonymous bucketing id the server evaluated against. Emitted into
-   * window.__SE_BOOTSTRAP and persisted (pre-paint) to the first-party
-   * `__se_anon_id` cookie, so the browser SDK buckets identically to SSR.
-   * Normally minted by edge middleware; this write is the fallback for routes
-   * middleware doesn't cover. See experiment-platform/18-identity-bucketing.md.
+   * Stable anonymous bucketing id the server evaluated against. Emitted as
+   * `data-anon-id`; se-bootstrap.js exposes it on window.__SE_BOOTSTRAP and
+   * persists it (pre-paint) to the first-party `__se_anon_id` cookie, so the
+   * browser SDK buckets identically to SSR. Normally minted by edge
+   * middleware; this is the fallback for routes it doesn't cover. See
+   * experiment-platform/18-identity-bucketing.md.
    */
   anonId?: string;
+  /**
+   * Public client key. When provided, the i18n loader tag can revalidate
+   * strings at runtime (`data-key`). Optional — the bootstrap tag NEVER carries
+   * a key, and SSR first paint works keyless via `data-strings`.
+   */
+  clientKey?: string;
+  /** CDN base for the tag `src`s. Defaults to https://cdn.shipeasy.ai. */
+  baseUrl?: string;
+}
+
+export interface ScriptTagSpec {
+  src: string;
+  /** Attribute name → value. An empty-string value renders as a bare boolean attribute (e.g. `data-se-bootstrap`). */
+  attrs: Record<string, string>;
+}
+
+export interface BootstrapData {
+  /** se-bootstrap.js tag — always present. */
+  bootstrap: ScriptTagSpec;
+  /** i18n loader tag — null when there are no SSR strings and no client key. */
+  i18nLoader: ScriptTagSpec | null;
+}
+
+const DEFAULT_CDN = "https://cdn.shipeasy.ai";
+
+/**
+ * Build the structured `<script>` tag specs for the SSR bootstrap. Render
+ * these as REAL `<script>` elements (React: scripts set via innerHTML do not
+ * execute). No SDK key is ever embedded in the bootstrap tag.
+ */
+export function getBootstrapData(
+  bootstrap: BootstrapPayload | null,
+  i18nData: I18nForRequest | null,
+  opts: BootstrapEmitOptions,
+): BootstrapData {
+  const base = (opts.baseUrl ?? DEFAULT_CDN).replace(/\/$/, "");
+  const profile = opts.i18nProfile ?? "en:prod";
+
+  const attrs: Record<string, string> = {
+    "data-se-bootstrap": "",
+    "data-flags": JSON.stringify(bootstrap?.flags ?? {}),
+    "data-configs": JSON.stringify(bootstrap?.configs ?? {}),
+    "data-experiments": JSON.stringify(bootstrap?.experiments ?? {}),
+    "data-killswitches": JSON.stringify(bootstrap?.killswitches ?? {}),
+    "data-i18n-profile": profile,
+    "data-api-url": base,
+  };
+  if (opts.anonId) attrs["data-anon-id"] = opts.anonId;
+  const bootstrapTag: ScriptTagSpec = { src: `${base}/sdk/bootstrap.js`, attrs };
+
+  let i18nLoader: ScriptTagSpec | null = null;
+  const hasStrings = !!(i18nData?.strings && Object.keys(i18nData.strings).length > 0);
+  if (hasStrings || opts.clientKey) {
+    const i18nAttrs: Record<string, string> = { "data-profile": profile };
+    if (opts.clientKey) i18nAttrs["data-key"] = opts.clientKey;
+    if (hasStrings) {
+      i18nAttrs["data-strings"] = JSON.stringify(i18nData!.strings);
+      i18nAttrs["data-locale"] = i18nData!.locale;
+    }
+    i18nLoader = { src: `${base}/sdk/i18n/loader.js`, attrs: i18nAttrs };
+  }
+
+  return { bootstrap: bootstrapTag, i18nLoader };
+}
+
+/** Escape a value for safe inclusion in a double-quoted HTML attribute. */
+function escapeAttr(v: string): string {
+  return v
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderScriptTag(spec: ScriptTagSpec): string {
+  const attrs = Object.entries(spec.attrs)
+    .map(([k, v]) => (v === "" ? ` ${k}` : ` ${k}="${escapeAttr(v)}"`))
+    .join("");
+  return `<script src="${escapeAttr(spec.src)}"${attrs}></script>`;
 }
 
 /**
- * Returns a vanilla-JS string for a single inline <script> tag. Handles
- * everything the client needs at startup EXCEPT the key — no SDK key is ever
- * embedded here (the server only knows the server key, which must stay
- * server-side). The browser supplies its own client key via
- * `shipeasy({ clientKey })` from @shipeasy/sdk/client, which also injects the
- * runtime i18n loader. This script emits:
- *   - window.__se_devtools_config (when devtoolsAdminUrl is set)
- *   - window.__SE_BOOTSTRAP (flags + configs + experiments + i18n DATA + i18nProfile, NO key)
- *   - window.i18n shim from SSR strings (prevents hydration mismatches / FOUC)
- *   - devtools overlay loader when ?se / ?se_devtools is present
- *
- * Framework-agnostic: set innerHTML on a <script> element, nothing else required.
+ * The bootstrap (and optional i18n loader) tags as an HTML string, for non-React
+ * SSR (Express, raw templates) where the markup is emitted directly into the
+ * served HTML and executes normally. React callers should use
+ * {@link getBootstrapData} and render real `<script>` elements instead.
  */
-export function getBootstrapHtml(
+export function getBootstrapTags(
   bootstrap: BootstrapPayload | null,
   i18nData: I18nForRequest | null,
-  opts: BootstrapHtmlOptions,
+  opts: BootstrapEmitOptions,
 ): string {
-  const parts: string[] = [];
-  const apiUrl = "https://cdn.shipeasy.ai";
-  const profile = opts.i18nProfile ?? "en:prod";
-
-  const payload: Record<string, unknown> = {
-    flags: bootstrap?.flags ?? {},
-    configs: bootstrap?.configs ?? {},
-    experiments: bootstrap?.experiments ?? {},
-    // No key here — the server only knows the server key, which must never reach
-    // the browser. The client supplies its own client key via shipeasy({ clientKey }).
-    i18nProfile: profile,
-    apiUrl,
-  };
-  if (i18nData) payload.i18n = i18nData;
-  if (opts.editLabels) payload.editLabels = true;
-  if (opts.anonId) payload.anonId = opts.anonId;
-
-  // Edit-labels shim. With ?se_edit_labels=1 the devtools overlay needs every
-  // translated string to render as `￹key￺value￻` so it can scan
-  // the DOM and enable in-place editing. We define a setter on window.i18n
-  // that intercepts the inline shim's assignment (a few lines below) AND any
-  // later assignment from the CDN loader, wrapping .t() in both cases. Must
-  // be the first statement so neither assignment slips past unwrapped.
-  //
-  // Detection mirrors the server: URL param OR persisted cookie. The cookie is
-  // what allows SSR to keep rendering markers across navigations after the
-  // first ?se_edit_labels=1 visit. If the client only checked the URL, the
-  // server would emit marker-wrapped text (cookie still set) while the client
-  // rendered plain text — a hydration mismatch on every navigation in the 24h
-  // cookie window.
-  parts.push(
-    `(function(){` +
-      `var Q=new URLSearchParams(location.search).has('se_edit_labels');` +
-      `var C=/(?:^|;\\s*)se_edit_labels=1(?:;|$)/.test(document.cookie);` +
-      `if(!Q&&!C)return;` +
-      // Refresh the cookie on every URL-param visit so testers stay in edit
-      // mode for the next 24h without re-typing the param. Cookie-only visits
-      // skip the write — already set, no need to re-stamp.
-      `if(Q){try{document.cookie='se_edit_labels=1;path=/;max-age=86400;samesite=lax';}catch(_){}}` +
-      `var R;` +
-      `function P(v){` +
-      `if(!v||typeof v.t!=='function'||v.__sePatched)return;` +
-      `var O=v.t.bind(v);` +
-      `v.__sePatched=true;` +
-      `window._sei18n_t=O;` +
-      `v.t=function(k,vars){` +
-      `var r=O(k,vars);` +
-      `if(r===k)return k;` +
-      // 3-section marker: key | varsJson | value. varsJson is "" when no vars.
-      // Stringification is wrapped in try/catch so circular vars never break the page.
-      `var V='';try{if(vars&&typeof vars==='object'){var hasKey=false;for(var _k in vars){hasKey=true;break;}if(hasKey)V=JSON.stringify(vars);}}catch(_){V='';}` +
-      `return '\\uFFF9'+k+'\\uFFFA'+V+'\\uFFFA'+r+'\\uFFFB';` +
-      `};` +
-      `}` +
-      `Object.defineProperty(window,'i18n',{configurable:true,` +
-      `get:function(){return R;},` +
-      `set:function(v){P(v);R=v;}});` +
-      `})();`,
-  );
-
-  parts.push(`window.__SE_BOOTSTRAP=${JSON.stringify(payload)};`);
-
-  // Persist the SSR bucketing id to a first-party cookie when edge middleware
-  // didn't already set it (routes outside the middleware matcher). Pre-paint and
-  // JS-readable (no httpOnly) so the browser SDK adopts the exact id SSR bucketed
-  // against. Skips the write when the cookie is already present.
-  if (opts.anonId) {
-    parts.push(
-      `(function(){try{var k=${JSON.stringify(ANON_ID_COOKIE)},v=${JSON.stringify(opts.anonId)};` +
-        `if(('; '+document.cookie).indexOf('; '+k+'=')===-1){` +
-        `document.cookie=k+'='+v+';path=/;max-age=31536000;samesite=lax'+` +
-        `(location.protocol==='https:'?';secure':'');}` +
-        `}catch(_){}})();`,
-    );
-  }
-
-  if (i18nData?.strings && Object.keys(i18nData.strings).length > 0) {
-    parts.push(
-      `(function(){var d=window.__SE_BOOTSTRAP.i18n;if(!d)return;` +
-        `window.i18n={locale:d.locale,` +
-        `t:function(k,v){var r=d.strings[k];if(!r)return k;` +
-        `return v?r.replace(/\\{\\{(\\w+)\\}\\}/g,function(_,p){return v[p]!==undefined?String(v[p]):'{{'+p+'}}'}):r;},` +
-        `on:function(){return function(){};}};` +
-        `})();`,
-    );
-  }
-
-  // NOTE: the runtime i18n loader (<script src=.../sdk/i18n/loader.js data-key>)
-  // is NO LONGER injected here. It needs the client key, which the server does
-  // not hold. The client entrypoint (`shipeasy({ clientKey })` in
-  // @shipeasy/sdk/client) injects the loader with its own client key. The SSR
-  // i18n shim above already populates window.i18n for first paint, so there is
-  // no untranslated flash before the client loader takes over.
-
-  // NOTE: the devtools overlay loader is NO LONGER injected here.
-  // Devtools are now self-bootstrapping via a standalone <script> tag:
-  //   <script src="https://cdn.shipeasy.ai/se-devtools.js"
-  //           data-client-api-key="<CLIENT_KEY>"
-  //           data-project-id="<PROJECT_ID>"></script>
-  // This works on any platform (not just TypeScript) and needs no server-side
-  // rendering. Place the tag in your HTML <head> directly — no SDK call required.
-
-  return parts.join("");
+  const data = getBootstrapData(bootstrap, i18nData, opts);
+  const tags = [data.bootstrap];
+  if (data.i18nLoader) tags.push(data.i18nLoader);
+  return tags.map(renderScriptTag).join("");
 }
 
 export const flags = {
